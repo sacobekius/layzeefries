@@ -1,5 +1,5 @@
 #include <Arduino.h>
-#include <AP33772S.h>
+#include <../include/regusbcpow.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
@@ -15,6 +15,7 @@
 #define RELAIS2 4
 #define WARMTE_VRAAG 5
 #define TEMPERATUUR_IN 6
+#define ROTOPD_INT 7
 
 #define MODE_KOELEN 1
 #define MODE_VERWARMEN 2
@@ -23,7 +24,7 @@
 #define MODE_UIT 5
 #define MODE_FOUT 6
 
-AP33772S usbpd;
+regUSBCPow usbpd;
 DeviceAddress temperatuurMeter;
 OneWire oneWire(TEMPERATUUR_IN);
 DallasTemperature sensors(&oneWire);
@@ -50,7 +51,6 @@ int ledMoment = 0;
 void ledTick()
 {
   int ledPlanI;
-  long now;
 
   for (ledPlanI = 0; ledPlanI < aantalLedPlannen; ledPlanI++) {
     if (ledMoment > ledPlannen[ledPlanI].deel && ledPlannen[ledPlanI].aan) {
@@ -79,7 +79,7 @@ void setLedPlan(int led, int deel)
     Serial.print(deel);
     Serial.print(")\n");
   }
-  for (ledPlanI = 0; ledPlannen[ledPlanI].led != led && ledPlanI < aantalLedPlannen; ledPlanI++);
+  for (ledPlanI = 0; ledPlannen[ledPlanI].led != led && ledPlanI < aantalLedPlannen; ledPlanI++) {}
   if (ledPlanI < sizeof(ledPlannen)/sizeof(ledPlan)) {
     ledPlannen[ledPlanI].led = led;
     ledPlannen[ledPlanI].deel = deel;
@@ -90,7 +90,7 @@ void setLedPlan(int led, int deel)
 
 void initLedPlannen()
 {
-  int ledPlanI;
+  unsigned int ledPlanI;
 
   for (ledPlanI = 0; ledPlanI < sizeof(ledPlannen)/sizeof(ledPlan); ledPlanI++) {
     ledPlannen[ledPlanI].led = -1;
@@ -103,59 +103,58 @@ void stroomTick()
 {
   int huidig_stroom;
   int huidig_voltage;
-  int nieuw_voltage;
+  long nieuw_voltage;
   int nieuw_stroom;
   float delta_perc;
+  float weerstand;
 
-  huidig_stroom = usbpd.readCurrent();
-  huidig_voltage = usbpd.readVoltage();
+  huidig_stroom = usbpd.leesStroom();
+  huidig_voltage = usbpd.leesVoltage();
   Serial.print("Huidig: ");
   Serial.print(huidig_stroom);
   Serial.print("mA\t");
   Serial.print(huidig_voltage);
   Serial.print("mV\t");
+  weerstand = (float) huidig_voltage / huidig_stroom;
   delta_perc = (doel_stroom - huidig_stroom)*100.0/doel_stroom;
   Serial.print(delta_perc);
+  Serial.print("%\t");
+  Serial.print(weerstand);
 
   if (delta_perc > 80.0) {
     nieuw_voltage = 5000;
     nieuw_stroom = 2000;
   } else {
-    nieuw_voltage = huidig_voltage + delta_perc * huidig_voltage/100.0;
+    nieuw_voltage = round((float) doel_stroom * weerstand);
     nieuw_stroom = doel_stroom;
   }
-  /* Normaliseer voltage naar stappen van 200Mv */
-  nieuw_voltage = (nieuw_voltage / 200) * 200;
-  Serial.print("%\t Nieuw: ");
+  /* Normaliseer voltage naar stappen van 100Mv */
+  nieuw_voltage = (nieuw_voltage / 100) * 100;
+  Serial.print("ohm\t Nieuw: ");
   Serial.print(nieuw_stroom);
   Serial.print("mA\t");
   Serial.print(nieuw_voltage);
   Serial.print("mV\n");
   if (delta_perc > 0){
-    setLedPlan(LEDBLAUW, 10-int((delta_perc/10)));
+    setLedPlan(LEDBLAUW, 10-round((delta_perc/10)));
     setLedPlan(LEDROOD, 0);
   } else {
     setLedPlan(LEDBLAUW, 10);
     setLedPlan(LEDROOD, int(-delta_perc/10));
   }
 
-  if (AVSIndex >= 0 && nieuw_voltage >= 15000)
-    usbpd.setAVSPDO(AVSIndex, nieuw_voltage, nieuw_stroom);
-  else {
-    if (PPSIndex >= 0)
-      usbpd.setPPSPDO(PPSIndex, nieuw_voltage, nieuw_stroom);
-  }
+  usbpd.setVoltage(nieuw_voltage);
 }
 
 void stroomConstantAan(int stroom)
 {
-  usbpd.setOutput(1);
+  usbpd.outputAan();
   doel_stroom = stroom;
 }
 
 void stroomUit()
 {
-  usbpd.setOutput(0);
+  usbpd.outputUit();
   doel_stroom = 0;
 }
 
@@ -168,8 +167,6 @@ void testLed(int led)
 
 void temperatuurTick()
 {
-  long now;
-
   sensors.requestTemperatures();
   huidige_temperatuur = sensors.getTempC(temperatuurMeter);
   Serial.print(huidige_temperatuur);
@@ -269,19 +266,13 @@ void setup() {
   testLed(LEDGROEN);
   testLed(LEDROOD);
   usbpd.begin();
-  usbpd.displayProfiles();
-  PPSIndex = usbpd.getPPSIndex();
-  Serial.print("PPSIndex: ");
-  Serial.println(PPSIndex);
-  AVSIndex = usbpd.getAVSIndex();
-  Serial.print("AVSIndex: ");
-  Serial.println(AVSIndex);
-  if (AVSIndex == -1 && PPSIndex == -1) {
-    ledAan(LEDROOD);
-    huidige_mode = MODE_FOUT;
-  } else {
+  usbpd.printTo(Serial);
+  if (usbpd.setVoltage(5000)) {
     ledAan(LEDGROEN);
     stroomUit();
+  } else {
+    ledAan(LEDROOD);
+    huidige_mode = MODE_FOUT;
   }
   sensors.begin();
   numberOfSensors = sensors.getDeviceCount();
@@ -300,10 +291,10 @@ void setup() {
   ledUit(LEDGEEL);
 }
 
-long next_vraagTick = 0;
-long next_stroomTick = 0;
-long next_temperatuurTick = 0;
-long next_ledTick = 0;
+unsigned long next_vraagTick = 0;
+unsigned long next_stroomTick = 0;
+unsigned long next_temperatuurTick = 0;
+unsigned long next_ledTick = 0;
 
 void loop() {
   unsigned long now = millis();
