@@ -29,6 +29,7 @@ DeviceAddress temperatuurMeter;
 OneWire oneWire(TEMPERATUUR_IN);
 DallasTemperature sensors(&oneWire);
 int numberOfSensors;
+bool testSucces = true;
 
 int doel_stroom;
 int PPSIndex;
@@ -50,16 +51,14 @@ int ledMoment = 0;
 
 void ledTick()
 {
-  int ledPlanI;
-
-  for (ledPlanI = 0; ledPlanI < aantalLedPlannen; ledPlanI++) {
+  for (int ledPlanI = 0; ledPlanI < aantalLedPlannen; ledPlanI++) {
     if (ledMoment > ledPlannen[ledPlanI].deel && ledPlannen[ledPlanI].aan) {
       ledUit(ledPlannen[ledPlanI].led);
-      ledPlannen[ledPlanI].aan = 0;
+      ledPlannen[ledPlanI].aan = false;
     }
     if (ledMoment <= ledPlannen[ledPlanI].deel && !ledPlannen[ledPlanI].aan) {
       ledAan(ledPlannen[ledPlanI].led);
-      ledPlannen[ledPlanI].aan = 1;
+      ledPlannen[ledPlanI].aan = true;
     }
   }
   if (ledMoment++ > 10)
@@ -72,7 +71,7 @@ void setLedPlan(int led, int deel)
 {
   int ledPlanI;
 
-  if (0) {
+  if (false) {
     Serial.print("setLedPlan(");
     Serial.print(led);
     Serial.print(", ");
@@ -90,70 +89,70 @@ void setLedPlan(int led, int deel)
 
 void initLedPlannen()
 {
-  unsigned int ledPlanI;
-
-  for (ledPlanI = 0; ledPlanI < sizeof(ledPlannen)/sizeof(ledPlan); ledPlanI++) {
-    ledPlannen[ledPlanI].led = -1;
-    ledPlannen[ledPlanI].deel = 0;
-    ledPlannen[ledPlanI].aan = 0;
+  for (auto & ledPlanI : ledPlannen) {
+    ledPlanI.led = -1;
+    ledPlanI.deel = 0;
+    ledPlanI.aan = false;
   }
 }
 
 void stroomTick()
 {
-  int huidig_stroom;
-  int huidig_voltage;
-  long nieuw_voltage;
-  int nieuw_stroom;
-  float delta_perc;
-  float weerstand;
+  unsigned int nieuw_voltage;
+  unsigned int nieuw_stroom;
 
-  huidig_stroom = usbpd.leesStroom();
-  huidig_voltage = usbpd.leesVoltage();
+  unsigned int huidig_stroom = usbpd.leesStroom();
+  unsigned int huidig_voltage = usbpd.leesVoltage();
   Serial.print("Huidig: ");
   Serial.print(huidig_stroom);
   Serial.print("mA\t");
   Serial.print(huidig_voltage);
   Serial.print("mV\t");
-  weerstand = (float) huidig_voltage / huidig_stroom;
-  delta_perc = (doel_stroom - huidig_stroom)*100.0/doel_stroom;
-  Serial.print(delta_perc);
+  float weerstand;
+  if (huidig_stroom == 0)
+    weerstand = 10;
+  else
+    weerstand = (float) huidig_voltage / huidig_stroom;
+  float percentage = 100L - ((float) doel_stroom - huidig_stroom) * 100 / doel_stroom;
+  Serial.print(percentage);
   Serial.print("%\t");
   Serial.print(weerstand);
 
-  if (delta_perc > 80.0) {
-    nieuw_voltage = 5000;
-    nieuw_stroom = 2000;
-  } else {
-    nieuw_voltage = round((float) doel_stroom * weerstand);
-    nieuw_stroom = doel_stroom;
-  }
-  /* Normaliseer voltage naar stappen van 100Mv */
-  nieuw_voltage = (nieuw_voltage / 100) * 100;
+  nieuw_voltage = (unsigned int) ((float) doel_stroom * weerstand);
+  nieuw_stroom = doel_stroom;
+  if (nieuw_voltage > 28000)
+    nieuw_voltage = 28000;
+
   Serial.print("ohm\t Nieuw: ");
   Serial.print(nieuw_stroom);
   Serial.print("mA\t");
   Serial.print(nieuw_voltage);
   Serial.print("mV\n");
-  if (delta_perc > 0){
-    setLedPlan(LEDBLAUW, 10-round((delta_perc/10)));
+  if (percentage > 0){
+    setLedPlan(LEDBLAUW, round(percentage/10));
     setLedPlan(LEDROOD, 0);
   } else {
     setLedPlan(LEDBLAUW, 10);
-    setLedPlan(LEDROOD, int(-delta_perc/10));
+    setLedPlan(LEDROOD, (int)(-percentage/10));
   }
 
-  usbpd.setVoltage(nieuw_voltage);
+  if (!usbpd.setVoltage(nieuw_voltage, nieuw_stroom))
+    huidige_mode = MODE_FOUT;
+
 }
 
 void stroomConstantAan(int stroom)
 {
+  Serial.print("stroomConstantAan(");
+  Serial.print(stroom);
+  Serial.println(")\n");
   usbpd.outputAan();
   doel_stroom = stroom;
 }
 
 void stroomUit()
 {
+  Serial.println("stroomUit");
   usbpd.outputUit();
   doel_stroom = 0;
 }
@@ -175,11 +174,8 @@ void temperatuurTick()
 
 void vraagTick()
 {
-  int new_koude_stand;
-  int new_warmte_stand;
-
-  new_koude_stand = !digitalRead(KOUDE_VRAAG);
-  new_warmte_stand = !digitalRead(WARMTE_VRAAG);
+  int new_koude_stand = !digitalRead(KOUDE_VRAAG);
+  int new_warmte_stand = !digitalRead(WARMTE_VRAAG);
   if (new_koude_stand != koude_stand || new_warmte_stand != warmte_stand) {
     koude_stand = new_koude_stand;
     warmte_stand = new_warmte_stand;
@@ -188,13 +184,11 @@ void vraagTick()
 
 void check_mode()
 {
-  int nieuwe_mode;
-
-  nieuwe_mode = huidige_mode;
+  int nieuwe_mode = huidige_mode;
   if (huidige_mode != MODE_FOUT) {
     if (koude_stand && warmte_stand)
       nieuwe_mode = MODE_UIT;
-    if (koude_stand && !warmte_stand)
+    if ((koude_stand && !warmte_stand) || huidige_mode == MODE_NET_AAN)
       nieuwe_mode = MODE_KOELEN;
     if (!koude_stand && warmte_stand)
       nieuwe_mode = MODE_VERWARMEN;
@@ -207,23 +201,24 @@ void check_mode()
     switch (huidige_mode) {
       case MODE_UIT:
       case MODE_FOUT:
-      case MODE_CONTINUE:
         stroomUit();
         digitalWrite(RELAIS1, HIGH);
         digitalWrite(RELAIS2, HIGH);
         ledUit(LEDBLAUW);
         ledUit(LEDGEEL);
         break;
+      case MODE_CONTINUE:
+        break;
       case MODE_NET_AAN:
       case MODE_KOELEN:
-        stroomConstantAan(4900);
+        stroomConstantAan(2500);
         digitalWrite(RELAIS1, HIGH);
         digitalWrite(RELAIS2, HIGH);
         ledAan(LEDBLAUW);
         ledUit(LEDGEEL);
         break;
       case MODE_VERWARMEN:
-        stroomConstantAan(4900);
+        stroomConstantAan(2500);
         digitalWrite(RELAIS1, LOW);
         digitalWrite(RELAIS2, LOW);
         ledUit(LEDBLAUW);
@@ -243,7 +238,7 @@ void check_mode()
 
 void setup() {
   Wire.begin();
-  Wire.setClock(400000);
+  usbpd.begin(ROTOPD_INT);
 
   Serial.begin(9600);
   delay(1000); //Ensure everything got enough time to bootup
@@ -258,22 +253,24 @@ void setup() {
 
   pinMode(RELAIS1, OUTPUT);
   pinMode(RELAIS2, OUTPUT);
-  digitalWrite(RELAIS1, HIGH);
-  digitalWrite(RELAIS2, HIGH);
+  digitalWrite(RELAIS1, LOW);
+  digitalWrite(RELAIS2, LOW);
 
   testLed(LEDBLAUW);
+  digitalWrite(RELAIS1, HIGH);
+  digitalWrite(RELAIS2, HIGH);
   testLed(LEDGEEL);
+  digitalWrite(RELAIS1, LOW);
+  digitalWrite(RELAIS2, LOW);
   testLed(LEDGROEN);
+  digitalWrite(RELAIS1, HIGH);
+  digitalWrite(RELAIS2, HIGH);
   testLed(LEDROOD);
-  usbpd.begin();
-  usbpd.printTo(Serial);
-  if (usbpd.setVoltage(5000)) {
-    ledAan(LEDGROEN);
-    stroomUit();
-  } else {
-    ledAan(LEDROOD);
-    huidige_mode = MODE_FOUT;
-  }
+  digitalWrite(RELAIS1, LOW);
+  digitalWrite(RELAIS2, LOW);
+
+  // usbpd.srcpdo();
+  // usbpd.printTo(Serial);
   sensors.begin();
   numberOfSensors = sensors.getDeviceCount();
   if (numberOfSensors == 1 && sensors.getAddress(temperatuurMeter, 0)) {
@@ -283,12 +280,8 @@ void setup() {
   } else {
     Serial.print("Geen of te veel temperatuurmeters\n");
   }
-  delay(1000);
-  stroomConstantAan(2500);
   digitalWrite(RELAIS1, HIGH);
   digitalWrite(RELAIS2, HIGH);
-  ledAan(LEDBLAUW);
-  ledUit(LEDGEEL);
 }
 
 unsigned long next_vraagTick = 0;
@@ -297,24 +290,31 @@ unsigned long next_temperatuurTick = 0;
 unsigned long next_ledTick = 0;
 
 void loop() {
-  unsigned long now = millis();
-  if (huidige_mode != MODE_FOUT) {
-    if (now > next_vraagTick) {
-      next_vraagTick = now + 1000;
-      vraagTick();
+  if (testSucces)
+  {
+    unsigned long now = millis();
+    usbpd.handleWork();
+    check_mode();
+    if (huidige_mode != MODE_FOUT) {
+      if (now > next_vraagTick) {
+        next_vraagTick = now + 1000;
+        vraagTick();
+      }
+      if (now > next_stroomTick) {
+        next_stroomTick = now + 5000;
+        stroomTick();
+      }
+      if (now > next_temperatuurTick) {
+        next_temperatuurTick = now + 60000;
+        temperatuurTick();
+      }
+      if (now > next_ledTick) {
+        next_ledTick = now + 200;
+        ledTick();
+      }
     }
-    if (now > next_stroomTick) {
-      next_stroomTick = now + 5000;
-      stroomTick();
-    }
-    if (now > next_temperatuurTick) {
-      next_temperatuurTick = now + 60000;
-      temperatuurTick();
-    }
-    if (now > next_ledTick) {
-      next_ledTick = now + 200;
-      ledTick();
-    }
+  } else
+  {
+
   }
-  check_mode();
 }
