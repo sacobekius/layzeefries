@@ -113,7 +113,7 @@ void regUSBCPow::srcpdo()
             int current = _currentMapInverse(_srcPDOs[i].avs.current_max);
             _pdos[i] = PDOInfo(
                 PDO_AVS,
-                _srcPDOs[i].avs.voltage_min * 200,
+                15000, // _srcPDOs[i].avs.voltage_min * 200,
                 _srcPDOs[i].avs.voltage_max * 200,
                 current
             );
@@ -137,7 +137,7 @@ bool regUSBCPow::setVoltage(unsigned int voltage_mV, unsigned int current_mA) {
 
     _huidigPDOIndex = -1;
     if (_avsPDOIndex > 0) {
-        if (voltage_mV >= 15000 &&
+        if (voltage_mV >= _pdos[_avsPDOIndex-1].voltage_min_mV &&
             voltage_mV <= _pdos[_avsPDOIndex-1].voltage_max_mV) {
             Serial.println("AVS");
             _huidigPDOIndex = _avsPDOIndex;
@@ -290,9 +290,10 @@ bool regUSBCPow::_stuurAan() {
     return true;
 }
 
-int regUSBCPow::_currentMap(int current_mA) {
-    if (current_mA < 1250) return 0;
-    return ((current_mA - 1250) / 250) + 1;
+unsigned int regUSBCPow::_currentMap(unsigned int current_mA) {
+    long signed_mAMinus1250 = (long)current_mA - 1250;
+    if (signed_mAMinus1250 < 0) return 0;
+    return (signed_mAMinus1250 / 250) + 1;
 }
 
 int regUSBCPow::_currentMapInverse(int waarde) {

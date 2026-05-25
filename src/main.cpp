@@ -2,6 +2,7 @@
 #include <../include/regusbcpow.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <avr/wdt.h>
 
 #define ledAan(led) digitalWrite(led, HIGH)
 #define ledUit(led) digitalWrite(led, LOW);
@@ -211,14 +212,14 @@ void check_mode()
         break;
       case MODE_NET_AAN:
       case MODE_KOELEN:
-        stroomConstantAan(2500);
+        stroomConstantAan(3000);
         digitalWrite(RELAIS1, HIGH);
         digitalWrite(RELAIS2, HIGH);
         ledAan(LEDBLAUW);
         ledUit(LEDGEEL);
         break;
       case MODE_VERWARMEN:
-        stroomConstantAan(2500);
+        stroomConstantAan(3000);
         digitalWrite(RELAIS1, LOW);
         digitalWrite(RELAIS2, LOW);
         ledUit(LEDBLAUW);
@@ -257,17 +258,9 @@ void setup() {
   digitalWrite(RELAIS2, LOW);
 
   testLed(LEDBLAUW);
-  digitalWrite(RELAIS1, HIGH);
-  digitalWrite(RELAIS2, HIGH);
   testLed(LEDGEEL);
-  digitalWrite(RELAIS1, LOW);
-  digitalWrite(RELAIS2, LOW);
   testLed(LEDGROEN);
-  digitalWrite(RELAIS1, HIGH);
-  digitalWrite(RELAIS2, HIGH);
   testLed(LEDROOD);
-  digitalWrite(RELAIS1, LOW);
-  digitalWrite(RELAIS2, LOW);
 
   // usbpd.srcpdo();
   // usbpd.printTo(Serial);
@@ -282,6 +275,8 @@ void setup() {
   }
   digitalWrite(RELAIS1, HIGH);
   digitalWrite(RELAIS2, HIGH);
+  while (WDT.STATUS & WDT_SYNCBUSY_bm);  // wacht op synchronisatie
+  _PROTECTED_WRITE(WDT.CTRLA, WDT_PERIOD_8KCLK_gc);  // 8 seconden
 }
 
 unsigned long next_vraagTick = 0;
@@ -294,6 +289,7 @@ void loop() {
   {
     unsigned long now = millis();
     usbpd.handleWork();
+    wdt_reset();
     check_mode();
     if (huidige_mode != MODE_FOUT) {
       if (now > next_vraagTick) {

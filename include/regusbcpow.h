@@ -106,7 +106,7 @@ private:
     bool _stuurAan();
 
     // Helpers
-    static int _currentMap(int current_mA);    // mA naar 4-bit
+    static unsigned int _currentMap(unsigned int current_mA);    // mA naar 4-bit
     static int _currentMapInverse(int waarde);
 
     // Bit field structs — implementatiedetail
