@@ -101,6 +101,7 @@ void stroomTick()
 {
   unsigned int nieuw_voltage;
   unsigned int nieuw_stroom;
+  static bool max_voltage = false;
 
   unsigned int huidig_stroom = usbpd.leesStroom();
   unsigned int huidig_voltage = usbpd.leesVoltage();
@@ -137,8 +138,12 @@ void stroomTick()
     setLedPlan(LEDROOD, (int)(-percentage/10));
   }
 
-  if (!usbpd.setVoltage(nieuw_voltage, nieuw_stroom))
-    huidige_mode = MODE_FOUT;
+  if ((percentage < 95 || percentage > 105) && !max_voltage)
+  {
+    if (!usbpd.setVoltage(nieuw_voltage, nieuw_stroom))
+      huidige_mode = MODE_FOUT;
+  }
+  max_voltage = nieuw_voltage == 28000;
 
 }
 
