@@ -55,6 +55,7 @@ public:
     // Instellen — schrijven naar AP33772S
     bool setVoltage(unsigned int voltage_mV, unsigned int current_mA);
     bool setStroom(unsigned int current_mA);
+    bool setMaxVermogen();  // AVS: vraag de maximale spanning/stroom-combinatie op
 
     // Meten — lezen van AP33772S registers
     unsigned int leesVoltage();              // mV, 80mV/LSB
@@ -84,6 +85,7 @@ private:
     unsigned int _huidigStroom_mA = 0;
     unsigned int _maxVoltage_mV = 0;
     unsigned int _maxStroom_mA = 5000;
+    bool _wilMax = false;  // AVS: stuur max. spanning/stroom i.p.v. berekende waarde (ook bij periodieke refresh)
 
     PDOType _huidigeModus = PDO_LEEG;
     PDOInfo _pdos[13] = {};  // zero-initialisatie

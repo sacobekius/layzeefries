@@ -1,7 +1,11 @@
 #include <arduino.h>
 #include <regusbcpow.h>
+#include "console.h"
 
-#define AP33772S_ADDRESS 0x52
+// uint8_t (i.p.v. #define, dus een int-literal): op de ESP32 heeft Wire's
+// requestFrom() meerdere overloads (uint8_t/uint16_t/int) die met een
+// ongetypeerd adres ambigu worden — dat gaf steeds een compiler-warning.
+static constexpr uint8_t AP33772S_ADDRESS = 0x52;
 #define READ_BUFF_LENGTH 128
 #define WRITE_BUFF_LENGTH 6
 #define SRCPDO_LENGTH 28
@@ -49,7 +53,7 @@ static void handleInterrupt()
     i2cPort->beginTransmission(AP33772S_ADDRESS);    // transmit to device SLAVE_ADDRESS
     i2cPort->write(0x01);                         // sets the CMD_STATUS register
     i2cPort->endTransmission();                     // stop transmitting
-    i2cPort->requestFrom(AP33772S_ADDRESS, 1);      // request 1 bytes from peripheral device
+    i2cPort->requestFrom(AP33772S_ADDRESS, (uint8_t) 1);  // request 1 byte from peripheral device
     if (i2cPort->available())
         interruptStatus = (byte)i2cPort->read();
     interruptFlag++;
@@ -64,7 +68,9 @@ regUSBCPow::regUSBCPow(TwoWire &wire) : _readBuf{}, _writeBuf{} {
 // Initialisatie
 void regUSBCPow::begin(int i)
 {
-    pinMode(i, INPUT);
+    // INPUT_PULLUP i.p.v. INPUT: voorkomt een zwevende pin (en dus interruptstorm)
+    // zolang de USB-PD print niet is aangesloten.
+    pinMode(i, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(i), handleInterrupt, FALLING);
     _writeBuf[0] = PDO_STARTED | PDO_READY | PDO_NEWPDO;
     i2c_write(CMD_MASK, 1);
@@ -134,19 +140,19 @@ void regUSBCPow::srcpdo()
 
 // Spanning instellen
 bool regUSBCPow::setVoltage(unsigned int voltage_mV, unsigned int current_mA) {
-
+    _wilMax = false;
     _huidigPDOIndex = -1;
     if (_avsPDOIndex > 0) {
         if (voltage_mV >= _pdos[_avsPDOIndex-1].voltage_min_mV &&
             voltage_mV <= _pdos[_avsPDOIndex-1].voltage_max_mV) {
-            Serial.println("AVS");
+            console.println("AVS");
             _huidigPDOIndex = _avsPDOIndex;
         }
     }
     if (_huidigPDOIndex < 0 && _ppsPDOIndex > 0) {
         if (voltage_mV >= _pdos[_ppsPDOIndex-1].voltage_min_mV &&
             voltage_mV <= _pdos[_ppsPDOIndex-1].voltage_max_mV) {
-            Serial.println("PPS");
+            console.println("PPS");
             _huidigPDOIndex = _ppsPDOIndex;
         }
     }
@@ -168,7 +174,37 @@ bool regUSBCPow::setVoltage(unsigned int voltage_mV, unsigned int current_mA) {
 
 // Stroom instellen
 bool regUSBCPow::setStroom(unsigned int current_mA) {
+    _wilMax = false;
     _huidigStroom_mA = current_mA;
+    return _stuurAan();
+}
+
+// Vraag het hoogst haalbare vermogen op. Voorkeur voor een Fixed PDO op zijn
+// max: die heeft geen VOLTAGE_SEL-onderhandeling nodig en dus geen
+// afrondings-/regelverlies (gemeten: AVS-max kwam net onder de PDO-max
+// van 28000mV uit, bv. 27200mV). Alleen als er geen Fixed PDO is, valt dit
+// terug op de AVS-max-aanvraag (0xF/0xFF sentinelwaarden).
+bool regUSBCPow::setMaxVermogen() {
+    int besteVasteIndex = -1;
+    for (int i = 0; i < 13; i++) {
+        if (_pdos[i].type != PDO_FIXED)
+            continue;
+        if (besteVasteIndex < 0 || _pdos[i].voltage_mV >= _pdos[besteVasteIndex].voltage_mV)
+            besteVasteIndex = i;
+    }
+
+    if (besteVasteIndex >= 0) {
+        _huidigPDOIndex = besteVasteIndex + 1;
+        _wilMax = false;  // Fixed PDO: gewoon de max. stroom van die PDO vragen
+        _huidigStroom_mA = _pdos[besteVasteIndex].current_max_mA;
+        return _stuurAan();
+    }
+
+    if (_avsPDOIndex <= 0)
+        return false;  // geen Fixed en geen AVS-PDO beschikbaar
+
+    _huidigPDOIndex = _avsPDOIndex;
+    _wilMax = true;
     return _stuurAan();
 }
 
@@ -239,11 +275,11 @@ void regUSBCPow::handleWork()
 
     if (interruptFlag > 0)
     {
-        Serial.print("interruptFlag: 0x");
-        Serial.println(interruptFlag, HEX);
+        console.print("interruptFlag: 0x");
+        console.println(interruptFlag, HEX);
         interruptFlag = 0;
-        Serial.print("interruptStatus: 0x");
-        Serial.println(interruptStatus, HEX);
+        console.print("interruptStatus: 0x");
+        console.println(interruptStatus, HEX);
         if (interruptStatus & PDO_NEWPDO)
             _newPdo = true;
         if (interruptStatus & PDO_READY)
@@ -256,7 +292,7 @@ void regUSBCPow::handleWork()
     if (now > _started_at && _ready && _newPdo)
     {
         srcpdo();
-        printTo(Serial);
+        printTo(console);
     }
     if (now > _next_avsTick)
     {
@@ -274,11 +310,17 @@ bool regUSBCPow::_stuurAan() {
     RDO_DATA_T rdo;
     rdo.data = 0;
     rdo.REQMSG_Fields.PDO_INDEX = _huidigPDOIndex;
-    rdo.REQMSG_Fields.CURRENT_SEL = _currentMap(_huidigStroom_mA);
 
-    if (huidigeModus == PDO_PPS || huidigeModus == PDO_AVS) {
-        int stap = (huidigeModus == PDO_AVS) ? 200 : 100;
-        rdo.REQMSG_Fields.VOLTAGE_SEL = _huidigVoltage_mV / stap;
+    if (_wilMax && huidigeModus == PDO_AVS) {
+        // Maximale spanning/stroom-combinatie opvragen i.p.v. een berekende waarde.
+        rdo.REQMSG_Fields.CURRENT_SEL = 0xF;
+        rdo.REQMSG_Fields.VOLTAGE_SEL = 0xFF;
+    } else {
+        rdo.REQMSG_Fields.CURRENT_SEL = _currentMap(_huidigStroom_mA);
+        if (huidigeModus == PDO_PPS || huidigeModus == PDO_AVS) {
+            int stap = (huidigeModus == PDO_AVS) ? 200 : 100;
+            rdo.REQMSG_Fields.VOLTAGE_SEL = _huidigVoltage_mV / stap;
+        }
     }
     if (huidigeModus == PDO_AVS)
     {
@@ -310,8 +352,8 @@ void regUSBCPow::i2c_read(byte cmdAddr, byte len)
     _trans_stat = i2cPort->endTransmission();        // stop transmitting
     if (_trans_stat != 0)
     {
-        Serial.print("I2C read failed: 0x");
-        Serial.println(_trans_stat, HEX);
+        console.print("I2C read failed: 0x");
+        console.println(_trans_stat, HEX);
     }
 
     i2cPort->requestFrom(AP33772S_ADDRESS, len);      // request len bytes from peripheral device
@@ -335,8 +377,8 @@ void regUSBCPow::i2c_write(byte cmdAddr, byte len)
     _trans_stat = i2cPort->endTransmission();        // stop transmitting
     if (_trans_stat != 0)
     {
-        Serial.print("I2C write failed: 0x");
-        Serial.println(_trans_stat, HEX);
+        console.print("I2C write failed: 0x");
+        console.println(_trans_stat, HEX);
     }
 
     // clear readBuffer

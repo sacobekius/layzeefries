@@ -2,20 +2,32 @@
 #include <../include/regusbcpow.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <avr/wdt.h>
+#include <esp_task_wdt.h>
+#include <WiFi.h>
+#include <ArduinoOTA.h>
+#include "console.h"
+#include "bleserial.h"
+#include "wifi_credentials.h"
 
 #define ledAan(led) digitalWrite(led, HIGH)
 #define ledUit(led) digitalWrite(led, LOW);
 
-#define LEDBLAUW 14
-#define LEDGEEL 15
-#define LEDGROEN 16
-#define LEDROOD 17
+// Let op: op de Nano ESP32 zijn de rauwe pinnummers 14-16 de onboard RGB-led
+// (i.p.v. A0-A2 zoals op de oude AVR Nano). Daarom hier expliciet A0..A3
+// gebruiken, zodat de LEDs op dezelfde header-pinnen blijven zitten.
+#define LEDBLAUW A0
+#define LEDGEEL A1
+#define LEDGROEN A2
+#define LEDROOD A3
 #define KOUDE_VRAAG 2
 #define RELAIS1 3
 #define RELAIS2 4
 #define WARMTE_VRAAG 5
-#define TEMPERATUUR_IN 6
+// OneWire bit-bangt via directe GPIO-registers (PIN_TO_BITMASK) en omzeilt
+// daarmee pinMode()/digitalWrite() — en dus ook de pin-remap-laag die "D6"
+// normaal naar de echte GPIO zou vertalen. Daarom hier het RAUWE GPIO-nummer
+// (9) i.p.v. het logische Nano-pinnummer "D6" (6).
+#define TEMPERATUUR_IN 9
 #define ROTOPD_INT 7
 
 #define MODE_KOELEN 1
@@ -73,11 +85,11 @@ void setLedPlan(int led, int deel)
   int ledPlanI;
 
   if (false) {
-    Serial.print("setLedPlan(");
-    Serial.print(led);
-    Serial.print(", ");
-    Serial.print(deel);
-    Serial.print(")\n");
+    console.print("setLedPlan(");
+    console.print(led);
+    console.print(", ");
+    console.print(deel);
+    console.print(")\n");
   }
   for (ledPlanI = 0; ledPlannen[ledPlanI].led != led && ledPlanI < aantalLedPlannen; ledPlanI++) {}
   if (ledPlanI < sizeof(ledPlannen)/sizeof(ledPlan)) {
@@ -97,39 +109,23 @@ void initLedPlannen()
   }
 }
 
+// Rapporterend: leest en print alleen. Het regelen (welke spanning/stroom we
+// vragen) gebeurt via usbpd.setMaxVermogen() in stroomConstantAan() — zolang
+// er nog geen PID-regeling is, vragen we gewoon het maximum op. Die nuance
+// (wanneer wel/niet maximum, welke setpoint) hoort thuis in de PID, niet hier.
 void stroomTick()
 {
-  unsigned int nieuw_voltage;
-  unsigned int nieuw_stroom;
-  static bool max_voltage = false;
-
   unsigned int huidig_stroom = usbpd.leesStroom();
   unsigned int huidig_voltage = usbpd.leesVoltage();
-  Serial.print("Huidig: ");
-  Serial.print(huidig_stroom);
-  Serial.print("mA\t");
-  Serial.print(huidig_voltage);
-  Serial.print("mV\t");
-  float weerstand;
-  if (huidig_stroom == 0)
-    weerstand = 10;
-  else
-    weerstand = (float) huidig_voltage / huidig_stroom;
+  console.print("Huidig: ");
+  console.print(huidig_stroom);
+  console.print("mA\t");
+  console.print(huidig_voltage);
+  console.print("mV\t");
   float percentage = 100L - ((float) doel_stroom - huidig_stroom) * 100 / doel_stroom;
-  Serial.print(percentage);
-  Serial.print("%\t");
-  Serial.print(weerstand);
+  console.print(percentage);
+  console.println("%");
 
-  nieuw_voltage = (unsigned int) ((float) doel_stroom * weerstand);
-  nieuw_stroom = doel_stroom;
-  if (nieuw_voltage > 28000)
-    nieuw_voltage = 28000;
-
-  Serial.print("ohm\t Nieuw: ");
-  Serial.print(nieuw_stroom);
-  Serial.print("mA\t");
-  Serial.print(nieuw_voltage);
-  Serial.print("mV\n");
   if (percentage > 0){
     setLedPlan(LEDBLAUW, round(percentage/10));
     setLedPlan(LEDROOD, 0);
@@ -137,28 +133,21 @@ void stroomTick()
     setLedPlan(LEDBLAUW, 10);
     setLedPlan(LEDROOD, (int)(-percentage/10));
   }
-
-  if ((percentage < 95 || percentage > 105) && !max_voltage)
-  {
-    if (!usbpd.setVoltage(nieuw_voltage, nieuw_stroom))
-      huidige_mode = MODE_FOUT;
-  }
-  max_voltage = nieuw_voltage == 28000;
-
 }
 
 void stroomConstantAan(int stroom)
 {
-  Serial.print("stroomConstantAan(");
-  Serial.print(stroom);
-  Serial.println(")\n");
+  console.print("stroomConstantAan(");
+  console.print(stroom);
+  console.println(")\n");
   usbpd.outputAan();
+  usbpd.setMaxVermogen();
   doel_stroom = stroom;
 }
 
 void stroomUit()
 {
-  Serial.println("stroomUit");
+  console.println("stroomUit");
   usbpd.outputUit();
   doel_stroom = 0;
 }
@@ -174,8 +163,8 @@ void temperatuurTick()
 {
   sensors.requestTemperatures();
   huidige_temperatuur = sensors.getTempC(temperatuurMeter);
-  Serial.print(huidige_temperatuur);
-  Serial.print("C\n");
+  console.print(huidige_temperatuur);
+  console.print("C\n");
 }
 
 void vraagTick()
@@ -242,12 +231,57 @@ void check_mode()
   }
 }
 
+void wifiOtaSetup()
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  console.print("Verbinden met WiFi");
+  for (int pogingen = 0; WiFi.status() != WL_CONNECTED && pogingen < 20; pogingen++) {
+    delay(500);
+    console.print(".");
+  }
+  console.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    console.print("WiFi verbonden, IP: ");
+    console.println(WiFi.localIP());
+  } else {
+    console.println("Geen WiFi-verbinding, ga verder zonder OTA");
+    return;
+  }
+
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    // Flash wissen/schrijven tijdens OTA kan langer blokkeren dan de 8s
+    // watchdog-timeout, zonder kans om esp_task_wdt_reset() aan te roepen.
+    // Tijdelijk afmelden voorkomt een reset midden in de overdracht.
+    esp_task_wdt_delete(NULL);
+    console.println("OTA update gestart");
+  });
+  ArduinoOTA.onEnd([]() {
+    esp_task_wdt_add(NULL);
+    console.println("OTA update klaar");
+  });
+  ArduinoOTA.onError([](ota_error_t fout) {
+    esp_task_wdt_add(NULL);
+    console.print("OTA fout: ");
+    console.println((int) fout);
+  });
+  ArduinoOTA.begin();
+}
+
 void setup() {
   Wire.begin();
   usbpd.begin(ROTOPD_INT);
 
   Serial.begin(9600);
   delay(1000); //Ensure everything got enough time to bootup
+
+  // BLE eerst opstarten: de TX-buffer/characteristic moeten al bestaan
+  // voordat wifiOtaSetup() begint te loggen, anders wordt die trace
+  // stilletjes weggegooid (write() heeft dan nog geen _txKenmerk).
+  bleSerial.begin(OTA_HOSTNAME);
+  wifiOtaSetup();
 
   pinMode(LEDBLAUW, OUTPUT);
   pinMode(LEDGEEL, OUTPUT);
@@ -256,7 +290,6 @@ void setup() {
 
   pinMode(KOUDE_VRAAG, INPUT_PULLUP);
   pinMode(WARMTE_VRAAG, INPUT_PULLUP);
-
   pinMode(RELAIS1, OUTPUT);
   pinMode(RELAIS2, OUTPUT);
   digitalWrite(RELAIS1, LOW);
@@ -268,20 +301,24 @@ void setup() {
   testLed(LEDROOD);
 
   // usbpd.srcpdo();
-  // usbpd.printTo(Serial);
+  // usbpd.printTo(console);
   sensors.begin();
+  console.println("sensors.begin: klaar");
   numberOfSensors = sensors.getDeviceCount();
   if (numberOfSensors == 1 && sensors.getAddress(temperatuurMeter, 0)) {
-    Serial.print("numberOfSensors: ");
-    Serial.println(numberOfSensors);
+    console.print("numberOfSensors: ");
+    console.println(numberOfSensors);
     sensors.setResolution(temperatuurMeter, 12);
   } else {
-    Serial.print("Geen of te veel temperatuurmeters\n");
+    console.print("numberOfSensors: ");
+    console.println(numberOfSensors);
+    console.println("Geen of te veel temperatuurmeters\n");
   }
   digitalWrite(RELAIS1, HIGH);
   digitalWrite(RELAIS2, HIGH);
-  while (WDT.STATUS & WDT_SYNCBUSY_bm);  // wacht op synchronisatie
-  _PROTECTED_WRITE(WDT.CTRLA, WDT_PERIOD_8KCLK_gc);  // 8 seconden
+
+  esp_task_wdt_init(8, true);  // 8 seconden, reset bij timeout
+  esp_task_wdt_add(NULL);      // volg de loop-task
 }
 
 unsigned long next_vraagTick = 0;
@@ -293,8 +330,10 @@ void loop() {
   if (testSucces)
   {
     unsigned long now = millis();
+    ArduinoOTA.handle();
     usbpd.handleWork();
-    wdt_reset();
+    bleSerial.tick();
+    esp_task_wdt_reset();
     check_mode();
     if (huidige_mode != MODE_FOUT) {
       if (now > next_vraagTick) {
