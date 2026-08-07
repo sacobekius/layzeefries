@@ -10,6 +10,18 @@ enum PDOType {
     PDO_AVS
 };
 
+// Actuele toestand van de RotoPD-koppeling — geen eenmalige events, een status
+// die handleWork() elke aanroep opnieuw teruggeeft. GEEN_PDO is ook de
+// beginwaarde en de fail-safe waarde bij I2C-communicatiefouten (bv. kabel
+// eruit/geen VBUS): als we het goed doen komen die communicatiefouten in
+// normaal bedrijf niet meer voor, en anders is er sowieso iets grondig mis —
+// vandaar geen aparte I2C_FOUT-waarde.
+enum class RotoPdStatus {
+    GEEN_PDO,      // geen bevestigd werkende PDO — niet verwarmen/koelen
+    PDO_OK,        // normale werking, een PDO is actief
+    PDO_OVERFLOW   // UVP/OVP/OCP/OTP-beveiliging getriggerd
+};
+
 class PDOInfo {
 public:
     PDOType type;
@@ -51,17 +63,40 @@ public:
     // Initialisatie
     void begin(int i);
     void srcpdo();
+    void reset();  // PD hard reset (PD_CMDMSG.HRST) — dwingt een schone herstart van de PD-onderhandeling af
 
     // Instellen — schrijven naar AP33772S
     bool setVoltage(unsigned int voltage_mV, unsigned int current_mA);
     bool setStroom(unsigned int current_mA);
-    bool setMaxVermogen();  // AVS: vraag de maximale spanning/stroom-combinatie op
 
     // Meten — lezen van AP33772S registers
     unsigned int leesVoltage();              // mV, 80mV/LSB
-    unsigned int leesStroom();               // mA, 24mA/LSB
-    unsigned int leesVREQ();                 // mV, overflow fix
-    int leesTemp();                 // °C
+    unsigned int leesStroom();                // mA, 24mA/LSB
+    unsigned int leesVREQ();                  // mV, aangevraagde spanning
+    unsigned int leesIREQ();                  // mA, aangevraagde stroom
+    int leesTemp();                           // °C
+
+    // Bereikbare spanning voor continue regeling — combineert AVS (hoge kant)
+    // en PPS (lage kant), net zoals setVoltage() zelf automatisch tussen
+    // AVS/PPS kiest op basis van de gevraagde spanning. Zo hoeft een
+    // regelaar (bv. de PID) zijn grenzen niet zelf vast te leggen. 0 zolang
+    // de PDO-lijst nog niet bekend is (of geen van beide aanwezig is).
+    unsigned int leesMinVoltage() const;   // mV — PPS-minimum, anders AVS-minimum
+    unsigned int leesMaxVoltage() const;   // mV — AVS-maximum, anders PPS-maximum
+
+    // Beveiligingsdrempels — lezen/instellen
+    unsigned int leesVSELMIN();               // mV, 200mV/LSB
+    void stelVSELMIN(unsigned int voltage_mV);
+    int leesUVPPercentage();                  // 70/75/80 (%), -1 = ongeldig
+    void stelUVPPercentage(int percentage);   // alleen 70, 75 of 80 geldig
+    unsigned int leesOVPTHR();                // mV, offset boven VREQ (default 2000mV)
+    void stelOVPTHR(unsigned int offset_mV);
+    unsigned int leesOCPTHR();                // mA
+    void stelOCPTHR(unsigned int current_mA);
+    int leesOTPTHR();                         // °C
+    void stelOTPTHR(int temp_C);
+    int leesDRTHR();                          // °C (de-rating drempel)
+    void stelDRTHR(int temp_C);
 
     // Uitgang
     bool outputAan();
@@ -69,11 +104,14 @@ public:
 
     // Interrupt configuratie
     // void handleInterrupt();         // ISR
-    void handleWork();
+    RotoPdStatus handleWork();
 
     // Status
     bool isKlaar();
     void printTo(Print &p) const;
+    // Rapporteert huidige/gevraagde spanning en stroom (leesStroom/
+    // leesVoltage/leesVREQ/leesIREQ) — niet const, die doen elk een I2C-read.
+    void printStatus(Print &p);
 
 private:
     // Geïnitialiseerd bij declaratie
@@ -83,18 +121,29 @@ private:
     int _huidigPDOIndex = -1;
     unsigned int _huidigVoltage_mV = 0;
     unsigned int _huidigStroom_mA = 0;
-    unsigned int _maxVoltage_mV = 0;
-    unsigned int _maxStroom_mA = 5000;
-    bool _wilMax = false;  // AVS: stuur max. spanning/stroom i.p.v. berekende waarde (ook bij periodieke refresh)
 
     PDOType _huidigeModus = PDO_LEEG;
     PDOInfo _pdos[13] = {};  // zero-initialisatie
+
+    RotoPdStatus _status = RotoPdStatus::GEEN_PDO;
 
     // Interrupt
     bool _newPdo = true;
     bool _ready = true;
     unsigned long _started_at = 0;
     unsigned long _next_avsTick;
+    // EPR-onderhandeling (de 28V-PDO's) komt soms pas iets ná de eerste
+    // NEWPDO-lijst binnen (gezien bij een live reconnect: eerste srcpdo()
+    // toonde alleen SPR-PDO's, AVS-index -1). Eenmalige her-lees-poging kort
+    // na de eerste succesvolle srcpdo(); 0xFFFFFFFF = "niet gepland".
+    unsigned long _herlees_pdo_at = 0xFFFFFFFF;
+    // Verificatie dat een aanvraag (_stuurAan()) ook echt is gehonoreerd:
+    // soms blijft de bron op zijn vorige/standaard contract hangen (bv. 5V)
+    // terwijl wij een andere spanning aanvroegen — de periodieke AVS-refresh
+    // alleen (elke 500ms _stuurAan() herhalen) loste dat niet altijd op.
+    // Bij aanhoudende mismatch forceert handleWork() een PD-reset.
+    unsigned long _next_verify_at = 0;
+    int _verify_mismatch_teller = 0;
 
     // I2C
     // AP3377S i2c adres
