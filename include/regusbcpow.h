@@ -69,12 +69,14 @@ public:
     bool setVoltage(unsigned int voltage_mV, unsigned int current_mA);
     bool setStroom(unsigned int current_mA);
 
-    // Meten — lezen van AP33772S registers
-    unsigned int leesVoltage();              // mV, 80mV/LSB
-    unsigned int leesStroom();                // mA, 24mA/LSB
-    unsigned int leesVREQ();                  // mV, aangevraagde spanning
-    unsigned int leesIREQ();                  // mA, aangevraagde stroom
-    int leesTemp();                           // °C
+    // Meten — gecachte waarden, ~1x/seconde bijgewerkt door handleWork()
+    // (niet meer een directe I2C-read per aanroep — alle operationele I2C
+    // zit geconcentreerd in handleWork(), zie de private members hieronder).
+    unsigned int leesVoltage() const;         // mV, 80mV/LSB
+    unsigned int leesStroom() const;          // mA, 24mA/LSB
+    unsigned int leesVREQ() const;            // mV, aangevraagde spanning
+    unsigned int leesIREQ() const;            // mA, aangevraagde stroom
+    int leesTemp();                           // °C — buiten scope, nog directe I2C (ongebruikt)
 
     // Bereikbare spanning voor continue regeling — combineert AVS (hoge kant)
     // en PPS (lage kant), net zoals setVoltage() zelf automatisch tussen
@@ -109,9 +111,9 @@ public:
     // Status
     bool isKlaar();
     void printTo(Print &p) const;
-    // Rapporteert huidige/gevraagde spanning en stroom (leesStroom/
-    // leesVoltage/leesVREQ/leesIREQ) — niet const, die doen elk een I2C-read.
-    void printStatus(Print &p);
+    // Rapporteert de gecachte spanning/stroom (leesStroom/leesVoltage/
+    // leesVREQ/leesIREQ) — geen eigen I2C meer, zie hierboven.
+    void printStatus(Print &p) const;
 
 private:
     // Geïnitialiseerd bij declaratie
@@ -137,19 +139,98 @@ private:
     // toonde alleen SPR-PDO's, AVS-index -1). Eenmalige her-lees-poging kort
     // na de eerste succesvolle srcpdo(); 0xFFFFFFFF = "niet gepland".
     unsigned long _herlees_pdo_at = 0xFFFFFFFF;
+
+    // srcpdo() bestaat zelf ook uit 2 losse I2C-reads (OPMODE, dan het grote
+    // SRCPDO-blok), elk in een eigen handleWork()-aanroep in plaats van
+    // synchroon achter elkaar — reads verbruiken _i2cVeilig niet (zie
+    // hierboven), dus dit is puur "één stap per aanroep", geen wachten op
+    // een tussenliggende READY. _srcpdoStap: 0 = nog niet begonnen (of net
+    // klaar) → eerst OPMODE lezen; 1 = OPMODE gedaan, SRCPDO nog te lezen.
+    // _srcpdoGewenst: een cyclus is aangevraagd (NEWPDO-event of de
+    // eenmalige EPR-nalees) maar nog niet (volledig) uitgevoerd.
+    // _srcpdoIsPrimair: alleen de NEWPDO-aanleiding doet na afloop de
+    // bookkeeping (printTo, EPR-nalees plannen, status naar PDO_OK) — de
+    // eenmalige EPR-nalees zelf niet, anders plant hij zichzelf steeds
+    // opnieuw.
+    uint8_t _srcpdoStap = 0;
+    bool _srcpdoGewenst = false;
+    bool _srcpdoIsPrimair = false;
+
+    // STATUS.READY is Read-to-Clear (datasheet: "1: Ready to receive I2C
+    // request/command"). Eerder dit project geprobeerd als een eenmalig
+    // token dat élk commando (of alleen elk schrijf-commando) zelf verbruikt
+    // — beide varianten bleken op echte hardware een dood punt te
+    // veroorzaken (zie git-historie): een gewone PD_REQMSG-write bleek niet
+    // altijd betrouwbaar gevolgd te worden door een nieuwe READY-interrupt,
+    // dus bleef alles na de eerste write soms voor altijd geblokkeerd.
+    // Uiteindelijke vorm: alleen de spanningsaanvraag zelf (_stuurAan()'s
+    // PD_REQMSG-write) zet _i2cVeilig op false — geen enkele andere
+    // i2c_read()/i2c_write() raakt 'm nog aan (ook niet bij een
+    // transactiefout). True wordt hij zodra handleWork()'s
+    // interrupt-verwerking een READY-bit ziet, of via een expliciete
+    // reset(). Alle andere I2C (output aan/uit, metingen, PDO-lijst lezen)
+    // wacht wel op dit veilig-moment om te vuren, maar consumeert het zelf
+    // niet — zo lopen de periodieke AVS-herbevestiging en een verse
+    // vraagbijstelling (allebei via _stuurAan()) elkaar niet meer in de weg
+    // via een omweg langs een ongerelateerd write-commando. Losstaand van
+    // _ready, die een eigen betekenis heeft (PDO-lijst-herlees-gate) en niet
+    // verstoord mag worden.
+    bool _i2cVeilig = false;
+
+    // Gecachte meetwaarden — één register per _i2cVeilig-beurt door
+    // handleWork() ververst (zie _meetStap), volledige cyclus ~1x/seconde
+    // gestart. Zie leesVoltage()/leesStroom()/leesVREQ()/leesIREQ().
+    unsigned int _gemetenVoltage_mV = 0;
+    unsigned int _gemetenStroom_mA = 0;
+    unsigned int _gemetenVREQ_mV = 0;
+    unsigned int _gemetenIREQ_mA = 0;
+    // Resultaat van de laatste PD_REQMSG/PD_CMDMSG (PD_MSGRLT.RESPONSE,
+    // datasheet: 0=busy/geen respons, 1=succes, 2=ongeldig commando/
+    // argument, 3=niet ondersteund/geweigerd door de bron, 4=transactie
+    // mislukt/geen GoodCRC). Puur diagnostisch — main.cpp doet er nog niets
+    // mee, alleen zichtbaar via printStatus().
+    uint8_t _gemetenPdResultaat = 0;
+    // Teruggelezen SYSTEM-register (0x06) — vooral voor VOUTCTL (bits 1:0:
+    // 0=auto, 1=force off, 2=force on), om te verifiëren dat outputAan()'s
+    // write ook echt is aangekomen zoals bedoeld, in plaats van blind op
+    // onze eigen _gewildOutputAan-intentie te vertrouwen.
+    uint8_t _gemetenSystem = 0;
+    unsigned long _next_meetTick = 0;
+    // 0=VOLTAGE, 1=CURRENT, 2=VREQ, 3=IREQ, 4=PD_MSGRLT, 5=SYSTEM — welke meting
+    // handleWork() als eerstvolgende oppakt zodra er weer een veilig moment
+    // is.
+    uint8_t _meetStap = 0;
+
     // Verificatie dat een aanvraag (_stuurAan()) ook echt is gehonoreerd:
     // soms blijft de bron op zijn vorige/standaard contract hangen (bv. 5V)
     // terwijl wij een andere spanning aanvroegen — de periodieke AVS-refresh
     // alleen (elke 500ms _stuurAan() herhalen) loste dat niet altijd op.
-    // Bij aanhoudende mismatch forceert handleWork() een PD-reset.
-    unsigned long _next_verify_at = 0;
+    // Bij aanhoudende mismatch forceert handleWork() een PD-reset. Hergebruikt
+    // _gemetenVREQ_mV (zelfde meet-tick), geen aparte I2C-read.
     int _verify_mismatch_teller = 0;
+
+    // "Wens vastleggen, centraal toepassen": setVoltage()/setStroom() doen
+    // zelf geen I2C meer, ze zetten deze vlag; handleWork() past 'm toe op
+    // zijn eigen ritme (of bij de periodieke AVS-herbevestiging).
+    bool _aansturingGewijzigd = false;
+
+    // Zelfde patroon voor outputAan()/outputUit().
+    bool _gewildOutputAan = false;
+    bool _outputWijzigingGewenst = false;
 
     // I2C
     // AP3377S i2c adres
     void i2c_read(uint8_t cmd, uint8_t len);
     void i2c_write(uint8_t cmd, uint8_t len);
     byte _trans_stat = 0;
+    // Aantal ACHTEREENVOLGENDE mislukte I2C-transacties (opgeteld in
+    // i2c_read()/i2c_write() zelf bij _trans_stat != 0, naar 0 bij succes) —
+    // geldt dus voor elke I2C-aanroep in de klasse. handleWork() degradeert
+    // pas naar RotoPdStatus::GEEN_PDO als dit een drempel haalt, niet al bij
+    // de eerste de beste NACK: op echte hardware bleek een losse, transiënte
+    // mislukking (bv. net de STATUS-read) geen betrouwbaar signaal dat de
+    // PDO echt weg is — de rest bleef gewoon werken.
+    int _i2cFoutTeller = 0;
 
     uint8_t _readBuf[32];
     uint8_t _writeBuf[8];

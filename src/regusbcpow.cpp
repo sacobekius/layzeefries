@@ -90,26 +90,46 @@ void regUSBCPow::begin(int i)
 
 void regUSBCPow::reset()
 {
+    // Een reset gooit de PD-onderhandeling om — tot de eerstvolgende verse
+    // READY-bit is I2C niet betrouwbaar (datasheet: READY = "ready to
+    // receive I2C request/command"). i2c_write() zelf zet _i2cVeilig al
+    // false zodra dit commando verstuurd wordt, geen aparte toewijzing nodig.
     _writeBuf[0] = 0x01;  // PD_CMDMSG.HRST
     i2c_write(CMD_PD_CMDMSG, 1);
 }
 
 void regUSBCPow::srcpdo()
 {
-    for (auto & _pdo : _pdos) {
-        _pdo = PDOInfo();
-    }
-    _ppsPDOIndex = -1;
-    _avsPDOIndex = -1;
-    _pdoCount = 0;
-    _huidigPDOIndex = -1;
-    _huidigVoltage_mV = 5000;
-    _huidigStroom_mA = 1000;
-    _newPdo = false;
-    i2c_read(CMD_OPMODE,1);
-    if (!_readBuf[0] & 0x02) // PD source?
+    if (_srcpdoStap == 0)
+    {
+        // Stap 0: alles resetten en OPMODE lezen (is dit wel een PD-bron?).
+        // De SRCPDO-read zelf wacht op de eerstvolgende veilige beurt —
+        // zie de toelichting bij _srcpdoStap in de header.
+        for (auto & _pdo : _pdos) {
+            _pdo = PDOInfo();
+        }
+        _ppsPDOIndex = -1;
+        _avsPDOIndex = -1;
+        _pdoCount = 0;
+        _huidigPDOIndex = -1;
+        _huidigVoltage_mV = 5000;
+        _huidigStroom_mA = 1000;
+        _newPdo = false;
+
+        i2c_read(CMD_OPMODE, 1);
+        if (!_readBuf[0] & 0x02) // PD source?
+        {
+            _srcpdoGewenst = false;  // niets te lezen, cyclus is klaar
+            return;
+        }
+        _srcpdoStap = 1;
         return;
+    }
+
+    // Stap 1: OPMODE was al gedaan, nu het eigenlijke PDO-blok.
     i2c_read(CMD_SRCPDO, 26);
+    _srcpdoStap = 0;
+    _srcpdoGewenst = false;
 
     _pdoCount = 0;
     for (int i = 0; i < 13; i++) {
@@ -151,6 +171,18 @@ void regUSBCPow::srcpdo()
             _ppsPDOIndex = i + 1;
         }
     }
+
+    printTo(console);
+    if (_srcpdoIsPrimair)
+    {
+        // EPR-PDO's (de 28V-opties) kunnen iets later pas klaar zijn dan de
+        // basis SPR-onderhandeling — alleen over 1s nog eens kijken als AVS
+        // er nu nog niet bij zat. Alleen de primaire (NEWPDO-)aanleiding
+        // doet dit; de eenmalige EPR-nalees zelf plant zichzelf niet opnieuw.
+        if (_avsPDOIndex <= 0)
+            _herlees_pdo_at = millis() + 1000;
+        _status = RotoPdStatus::PDO_OK;  // een verse PDO-lijst is per definitie weer OK
+    }
 }
 
 // Spanning instellen
@@ -183,49 +215,48 @@ bool regUSBCPow::setVoltage(unsigned int voltage_mV, unsigned int current_mA) {
     if (_huidigStroom_mA > _pdos[_huidigPDOIndex-1].current_max_mA)
         _huidigStroom_mA = _pdos[_huidigPDOIndex-1].current_max_mA;
 
-    return _stuurAan();
+    // Geen I2C hier — alleen de wens vastleggen, handleWork() past 'm toe
+    // op zijn eigen ritme (zie de "I2C veilig"-toelichting bij _i2cVeilig).
+    _aansturingGewijzigd = true;
+    return true;
 }
 
 // Stroom instellen
 bool regUSBCPow::setStroom(unsigned int current_mA) {
     _huidigStroom_mA = current_mA;
-    return _stuurAan();
+    _aansturingGewijzigd = true;
+    return true;
 }
 
-// Uitgang
+// Uitgang — geen I2C hier, alleen de wens vastleggen (zelfde patroon als
+// setVoltage()/setStroom()); handleWork() past 'm toe.
 bool regUSBCPow::outputAan() {
-    _writeBuf[0] = 0b00010010;
-    i2c_write(CMD_SYSTEM, 1);
+    _gewildOutputAan = true;
+    _outputWijzigingGewenst = true;
     return true;
 }
 
 bool regUSBCPow::outputUit() {
-    _writeBuf[0] = 0b00010001;
-    i2c_write(CMD_SYSTEM, 1);
+    _gewildOutputAan = false;
+    _outputWijzigingGewenst = true;
     return true;
 }
 
-// Meten
-unsigned int regUSBCPow::leesVoltage() {
-    i2c_read(CMD_VOLTAGE, 2);
-    return ((unsigned int)_readBuf[1] << 8 | _readBuf[0]) * 80;  // 80mV/LSB
+// Meten — gecachte waarden, zie _gemeten*_mV/_mA en de meet-tick in handleWork().
+unsigned int regUSBCPow::leesVoltage() const {
+    return _gemetenVoltage_mV;
 }
 
-unsigned int regUSBCPow::leesStroom() {
-    i2c_read(CMD_CURRENT, 1);
-    return (unsigned int)_readBuf[0] * 24;  // 24mA/LSB
+unsigned int regUSBCPow::leesStroom() const {
+    return _gemetenStroom_mA;
 }
 
-unsigned int regUSBCPow::leesVREQ() {
-    // VREQ (0x14) is een 2-byte register (datasheet Table 19) — voorheen
-    // werd hier maar 1 byte gelezen, dus alleen de lage byte.
-    i2c_read(CMD_VREQ, 2);
-    return ((unsigned int)_readBuf[1] << 8 | _readBuf[0]) * 50;  // 50mV/LSB
+unsigned int regUSBCPow::leesVREQ() const {
+    return _gemetenVREQ_mV;
 }
 
-unsigned int regUSBCPow::leesIREQ() {
-    i2c_read(CMD_IREQ, 2);
-    return ((unsigned int)_readBuf[1] << 8 | _readBuf[0]) * 10;  // 10mA/LSB
+unsigned int regUSBCPow::leesIREQ() const {
+    return _gemetenIREQ_mA;
 }
 
 int regUSBCPow::leesTemp() {
@@ -343,7 +374,7 @@ void regUSBCPow::printTo(Print &p) const {
     p.println(_avsPDOIndex);
 }
 
-void regUSBCPow::printStatus(Print &p) {
+void regUSBCPow::printStatus(Print &p) const {
     unsigned int huidig_stroom = leesStroom();
     unsigned int huidig_voltage = leesVoltage();
     unsigned int gevraagde_voltage = leesVREQ();
@@ -356,7 +387,18 @@ void regUSBCPow::printStatus(Print &p) {
     p.print(gevraagde_voltage);
     p.print("mV, ");
     p.print(gevraagde_stroom);
-    p.println("mA)");
+    p.print("mA) pdResultaat=");
+    p.print(_gemetenPdResultaat);
+    p.print(" system=0x");
+    p.print(_gemetenSystem, HEX);
+    p.print(" (VOUTCTL=");
+    p.print(_gemetenSystem & 0x03);
+    p.print(") i2cVeilig=");
+    p.print(_i2cVeilig ? "1" : "0");
+    p.print(" meetStap=");
+    p.print(_meetStap);
+    p.print(" i2cFoutTeller=");
+    p.println(_i2cFoutTeller);
 }
 
 RotoPdStatus regUSBCPow::handleWork()
@@ -370,19 +412,26 @@ RotoPdStatus regUSBCPow::handleWork()
         // ISR — lezen reset het register (datasheet: "Reset to 0 after every
         // Read"), dus dit is de enige plek waar we het mogen lezen.
         i2c_read(CMD_STATUS, 1);
-        if (_trans_stat != 0)
-        {
-            // Geen contact met de RotoPD (bv. kabel eruit/geen VBUS) — geen
-            // bevestigd werkende PDO, dus fail-safe terug naar GEEN_PDO.
-            _status = RotoPdStatus::GEEN_PDO;
-        }
-        else
+        // Bij falen niets te verwerken (geen geldige data) — de eventuele
+        // degradatie naar GEEN_PDO gebeurt hierna centraal, pas na een paar
+        // opeenvolgende mislukkingen (zie _i2cFoutTeller).
+        if (_trans_stat == 0)
         {
             interruptStatus = _readBuf[0];
-            // Geen trace hier: dit vuurt elke 500ms door de AVS-keepalive
-            // (_stuurAan() hieronder) en vervuilde de PID-observatie zonder
-            // nieuwe informatie — de interessante gevallen (fout-bits, nieuwe
-            // PDO-lijst) worden hieronder al apart afgehandeld/geprint.
+            // Tijdelijk terug (was eerder uitgezet, zie git-historie): deze
+            // keer specifiek om de nieuwe _i2cVeilig-logica (NEWPDO/fout-bits
+            // vs. een schone READY) op echte hardware te kunnen natrekken.
+            // Vuurt elke ~500ms mee met de AVS-keepalive — zet 'm weer uit
+            // zodra dat bevestigd is en de ruis weer gaat storen.
+            if (interruptStatus == 0x2)
+            {
+                console.print('.');
+            } else
+            {
+                console.print("interruptStatus: 0x");
+                console.println(interruptStatus, HEX);
+            }
+
             if (interruptStatus & (PDO_UVP | PDO_OVP | PDO_OCP | PDO_OTP))
             {
                 // Beveiliging getriggerd: chip schakelt VOUT uit. Datasheet:
@@ -399,12 +448,31 @@ RotoPdStatus regUSBCPow::handleWork()
             }
             if (interruptStatus & PDO_NEWPDO)
                 _newPdo = true;
-            if (interruptStatus & PDO_READY)
+            if (interruptStatus & PDO_READY) {
                 _ready = true;
+                // READY betekent veilig, ongeacht welke andere bits in
+                // hetzelfde STATUS-byte meekomen (NEWPDO, foutbits): op
+                // echte hardware zijn NEWPDO en READY zowel los na elkaar
+                // als samen in één byte gezien (afhankelijk van hoe snel
+                // handleWork() de STATUS-read oppakt) — READY negeren
+                // zodra er iets anders bij staat zou kunnen betekenen dat
+                // we wachten op een aparte, latere READY die op deze
+                // hardware soms nooit los voorkomt. Zonder een READY-bit
+                // blijft _i2cVeilig hoe dan ook al false: die is aan het
+                // begin van deze STATUS-read zelf al onvoorwaardelijk
+                // verbruikt (i2c_read()) en wordt alleen hier weer
+                // teruggegeven.
+                _i2cVeilig = true;
+            }
             if (interruptStatus & PDO_STARTED)
                 _started_at = now + 100;
-            _writeBuf[0] = PDO_STARTED | PDO_READY | PDO_NEWPDO;
-            i2c_write(CMD_MASK, 1);
+            // MASK (0x02) is een gewoon RW-configuratieregister, geen
+            // Read-to-Clear zoals STATUS (datasheet Table 11/20: geen
+            // "reset on read"-vermelding) — eenmalig gezet in begin()
+            // volstaat. Hem hier bij elke interrupt herschrijven was een
+            // overbodige tweede I2C-commando direct na de STATUS-read,
+            // zonder op een verse READY te wachten voor dat tweede
+            // commando — precies het patroon dat we nu juist vermijden.
         }
     }
     // Een vers NEWPDO-signaal betekent altijd: PDO-lijst opnieuw inlezen —
@@ -416,55 +484,149 @@ RotoPdStatus regUSBCPow::handleWork()
     // wél een volledige her-onderhandeling plaatsvond.
     if (_ready && _newPdo && now > _started_at)
     {
-        srcpdo();
-        printTo(console);
-        // EPR-PDO's (de 28V-opties) kunnen iets later pas klaar zijn dan de
-        // basis SPR-onderhandeling. Alleen over 1s nog eens kijken als AVS er
-        // nu nog niet bij zat — anders lezen/printen we de lijst nodeloos
-        // twee keer bij elke normale boot.
-        if (_avsPDOIndex <= 0)
-            _herlees_pdo_at = now + 1000;
-        _status = RotoPdStatus::PDO_OK;  // een verse PDO-lijst is per definitie weer OK
+        // Wens vastleggen, niet meteen lezen — srcpdo() zelf wacht met zijn
+        // I2C op _i2cVeilig (zie hieronder en de toelichting bij
+        // _srcpdoStap in de header).
+        _srcpdoGewenst = true;
+        _srcpdoIsPrimair = true;
     }
     if (now > _herlees_pdo_at)
     {
         _herlees_pdo_at = 0xFFFFFFFF;  // eenmalig
-        srcpdo();
-        printTo(console);
-    }
-    if (now > _next_avsTick)
-    {
-        _next_avsTick = now + 500;
-        _stuurAan();
-    }
-    // Verificatie: is de laatst aangevraagde spanning ook echt gehonoreerd?
-    // De periodieke AVS-refresh hierboven (elke 500ms _stuurAan() herhalen)
-    // loste dat niet altijd op — real-hardware logs lieten een aanvraag zien
-    // die minutenlang op de bron z'n vorige/standaard contract bleef hangen.
-    // Bij aanhoudende mismatch (~10s) forceert een PD-reset een schone
-    // heronderhandeling; de eerstvolgende aanroep van buitenaf (setVoltage())
-    // vraagt daarna vanzelf opnieuw aan, geen aparte hersteldelogica nodig.
-    if (_huidigPDOIndex > 0 && now > _next_verify_at)
-    {
-        _next_verify_at = now + 2000;
-        unsigned int vreq = leesVREQ();
-        int verschil = (int) vreq - (int) _huidigVoltage_mV;
-        if (verschil < 0) verschil = -verschil;
-        if (verschil > 200)
+        // Alleen aanvragen als er niet toevallig al een (primaire) cyclus
+        // onderweg is — anders zou deze aanvraag die halverwege ombuigen
+        // naar "niet-primair" en de afrondende bookkeeping ervan missen.
+        if (_srcpdoStap == 0)
         {
-            _verify_mismatch_teller++;
-            if (_verify_mismatch_teller >= 5)
+            _srcpdoGewenst = true;
+            _srcpdoIsPrimair = false;
+        }
+    }
+    // srcpdo() bestaat zelf ook uit losse I2C-reads (zie _srcpdoStap) — dus
+    // ook hier: pas oppakken op een veilig moment, en verder laten lopen
+    // zolang een cyclus al onderweg is (_srcpdoStap != 0), ongeacht of er
+    // ondertussen nog een nieuwe wens is bijgekomen.
+    if (_i2cVeilig && (_srcpdoGewenst || _srcpdoStap != 0))
+    {
+        srcpdo();
+    }
+    // Alle "gewone bedrijfsvoering"-I2C hieronder wacht op een veilig moment
+    // (zie _i2cVeilig hierboven) — zo staat alle operationele I2C op één
+    // plek, gecoördineerd, i.p.v. verspreid over losse aanroepen vanuit
+    // main.cpp op willekeurige momenten. _i2cVeilig is een grove
+    // aanspreekbaarheids-vlag, geen per-commando-token: zolang hij true is
+    // mogen meerdere van onderstaande blokken gewoon in dezelfde aanroep
+    // vuren.
+
+    // Output aan/uit — wens van outputAan()/outputUit().
+    if (_i2cVeilig && _outputWijzigingGewenst)
+    {
+        _writeBuf[0] = _gewildOutputAan ? 0b00010010 : 0b00010001;
+        i2c_write(CMD_SYSTEM, 1);
+        _outputWijzigingGewenst = false;
+    }
+
+    // Spanning/stroom — wens van setVoltage()/setStroom(), of de periodieke
+    // AVS-herbevestiging (_stuurAan() beheert _next_avsTick zelf, alleen
+    // relevant bij AVS).
+    if (_i2cVeilig && (_aansturingGewijzigd || now > _next_avsTick))
+    {
+        _stuurAan();
+        _aansturingGewijzigd = false;
+    }
+
+    // Metingen — VOLTAGE/CURRENT/VREQ/IREQ/PD_MSGRLT/SYSTEM, één register
+    // per aanroep (_meetStap telt 0..5) in plaats van alle 6 in één keer: puur
+    // om het niet allemaal in dezelfde handleWork()-aanroep te proppen, niet
+    // omdat een read op een READY zou moeten wachten (reads verbruiken
+    // _i2cVeilig niet, zie hierboven) — de cyclus loopt vanzelf door over
+    // opeenvolgende aanroepen totdat hij weer bij 0 uitkomt. _next_meetTick
+    // wordt pas dán vooruitgezet, dus de gate hieronder blokkeert alleen het
+    // *starten* van een nieuwe cyclus vóór zijn tijd, niet het afmaken van
+    // een lopende.
+    if (_i2cVeilig && now > _next_meetTick)
+    {
+        switch (_meetStap)
+        {
+            case 0:
+                i2c_read(CMD_VOLTAGE, 2);
+                _gemetenVoltage_mV = ((unsigned int) _readBuf[1] << 8 | _readBuf[0]) * 80;
+                break;
+            case 1:
+                i2c_read(CMD_CURRENT, 1);
+                _gemetenStroom_mA = (unsigned int) _readBuf[0] * 24;
+                break;
+            case 2:
+                // VREQ (0x14) is een 2-byte register (datasheet Table 19).
+                i2c_read(CMD_VREQ, 2);
+                _gemetenVREQ_mV = ((unsigned int) _readBuf[1] << 8 | _readBuf[0]) * 50;
+                break;
+            case 3:
+                i2c_read(CMD_IREQ, 2);
+                _gemetenIREQ_mA = ((unsigned int) _readBuf[1] << 8 | _readBuf[0]) * 10;
+                break;
+            case 4:
+                // PD_MSGRLT.RESPONSE (bits 2:0): 0=busy/geen respons,
+                // 1=succes, 2=ongeldig, 3=geweigerd door de bron,
+                // 4=transactie mislukt/geen GoodCRC — het daadwerkelijke
+                // resultaat van de laatste PD_REQMSG, in tegenstelling tot
+                // VREQ/IREQ (die volgens de EVB-guide alleen bij succes
+                // bijwerken, maar dat geeft geen reden waarom niet).
+                i2c_read(CMD_PD_MSGRLT, 1);
+                _gemetenPdResultaat = _readBuf[0] & 0x07;
+                break;
+            case 5:
+            default:
+                // SYSTEM teruglezen — vooral VOUTCTL (bits 1:0: 0=auto,
+                // 1=force off, 2=force on) om te verifiëren dat outputAan()'s
+                // write ook echt is aangekomen zoals bedoeld.
+                i2c_read(CMD_SYSTEM, 1);
+                _gemetenSystem = _readBuf[0];
+                break;
+        }
+
+        _meetStap = (_meetStap + 1) % 6;
+        if (_meetStap == 0)
+        {
+            // Cyclus rond: volgende cyclus plannen en de verificatie doen
+            // (gebruikt de net ververste VREQ uit deze cyclus).
+            _next_meetTick = now + 1000;
+
+            // Verificatie: is de laatst aangevraagde spanning ook echt
+            // gehonoreerd? Real-hardware logs lieten een aanvraag zien die
+            // minutenlang op de bron z'n vorige/standaard contract bleef
+            // hangen (de periodieke AVS-refresh hierboven loste dat niet
+            // altijd op). Bij aanhoudende mismatch (~10s) forceert een
+            // PD-reset een schone heronderhandeling; de eerstvolgende
+            // aansturing vraagt daarna vanzelf opnieuw aan.
+            if (_huidigPDOIndex > 0)
             {
-                console.println("PD-aanvraag blijft afwijken van wat gevraagd is — forceer PD-reset");
-                reset();
-                _verify_mismatch_teller = 0;
+                int verschil = (int) _gemetenVREQ_mV - (int) _huidigVoltage_mV;
+                if (verschil < 0) verschil = -verschil;
+                if (verschil > 200)
+                {
+                    _verify_mismatch_teller++;
+                    if (_verify_mismatch_teller >= 5)
+                    {
+                        console.println("PD-aanvraag blijft afwijken van wat gevraagd is — forceer PD-reset");
+                        reset();
+                        _verify_mismatch_teller = 0;
+                    }
+                }
+                else
+                {
+                    _verify_mismatch_teller = 0;
+                }
             }
         }
-        else
-        {
-            _verify_mismatch_teller = 0;
-        }
     }
+    // Pas na een paar ACHTEREENVOLGENDE mislukte I2C-transacties degraderen
+    // naar GEEN_PDO, niet al bij de eerste de beste — zie _i2cFoutTeller.
+    // Een enkele transiënte NACK (bv. net de STATUS-read) betekende op
+    // echte hardware niet dat de PDO ook echt weg was; de rest bleef gewoon
+    // werken.
+    if (_i2cFoutTeller >= 3)
+        _status = RotoPdStatus::GEEN_PDO;
     return _status;
 }
 
@@ -493,6 +655,7 @@ bool regUSBCPow::_stuurAan() {
     _writeBuf[0] = rdo.byte0;
     _writeBuf[1] = rdo.byte1;
     i2c_write(CMD_PD_REQMSG, 2);
+    _i2cVeilig = false;
     return true;
 }
 
@@ -516,7 +679,6 @@ int regUSBCPow::_currentMapInverse(int waarde) {
 
 void regUSBCPow::i2c_read(byte cmdAddr, byte len)
 {
-    // clear readBuffer
     memset(_readBuf, 0, sizeof(_readBuf));
     i2cPort->beginTransmission(AP33772S_ADDRESS);    // transmit to device SLAVE_ADDRESS
     i2cPort->write(cmdAddr);                         // sets the command register
@@ -525,6 +687,11 @@ void regUSBCPow::i2c_read(byte cmdAddr, byte len)
     {
         console.print("I2C read failed: 0x");
         console.println(_trans_stat, HEX);
+        _i2cFoutTeller++;
+    }
+    else
+    {
+        _i2cFoutTeller = 0;
     }
 
     i2cPort->requestFrom(AP33772S_ADDRESS, len);      // request len bytes from peripheral device
@@ -550,6 +717,11 @@ void regUSBCPow::i2c_write(byte cmdAddr, byte len)
     {
         console.print("I2C write failed: 0x");
         console.println(_trans_stat, HEX);
+        _i2cFoutTeller++;
+    }
+    else
+    {
+        _i2cFoutTeller = 0;
     }
 
     // clear readBuffer

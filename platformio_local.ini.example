@@ -1,0 +1,10 @@
+; Kopieer dit bestand naar platformio_local.ini en vul het OTA-wachtwoord in
+; (moet gelijk zijn aan OTA_PASSWORD in include/wifi_credentials.h).
+; platformio_local.ini staat in .gitignore en wordt niet gecommit.
+
+[env:nano_esp32_ota]
+extends = env:nano_esp32
+upload_protocol = espota
+upload_port = layzeefries.local
+upload_flags =
+    --auth=kies-een-ota-wachtwoord
