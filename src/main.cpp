@@ -29,7 +29,6 @@
 // normaal naar de echte GPIO zou vertalen. Daarom hier het RAUWE GPIO-nummer
 // (9) i.p.v. het logische Nano-pinnummer "D6" (6).
 #define TEMPERATUUR_IN 9
-#define ROTOPD_INT 7
 // Let op: dit is het LOGISCHE Nano-pinnummer "D9" (analogWrite() is
 // remap-bewust, i.t.t. OneWire hierboven). Toevallig ook een "9", maar dat
 // is een heel andere fysieke pin dan TEMPERATUUR_IN's RAUWE GPIO 9 (=D6)!
@@ -553,7 +552,7 @@ void wifiOtaSetup()
 
 void setup() {
   Wire.begin();
-  usbpd.begin(ROTOPD_INT);  // print o.a. de INA238 MANUFACTURER_ID-check
+  usbpd.begin();  // print o.a. de INA238 MANUFACTURER_ID-check; STATUS wordt voortaan gepolld, geen interrupt-pin meer nodig
 
   prefs.begin("layzee", false);
   doel_temperatuur = prefs.getFloat("doelC", DOEL_TEMPERATUUR_FALLBACK_C);
@@ -648,7 +647,7 @@ void loop() {
       pasAansturingToe(bepaalAansturing());
     }
     if (now > next_status_tick) {
-      next_status_tick = now + 5000;
+      next_status_tick = now + 60000;
       usbpd.printStatus(console);
     }
     if (now > next_ledTick) {

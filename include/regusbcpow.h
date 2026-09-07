@@ -61,7 +61,7 @@ class regUSBCPow {
 public:
     explicit regUSBCPow(TwoWire &wire=Wire);
     // Initialisatie
-    void begin(int i);
+    void begin();
     void srcpdo();
     void reset();  // PD hard reset (PD_CMDMSG.HRST) — dwingt een schone herstart van de PD-onderhandeling af
 
@@ -104,8 +104,6 @@ public:
     bool outputAan();
     bool outputUit();
 
-    // Interrupt configuratie
-    // void handleInterrupt();         // ISR
     RotoPdStatus handleWork();
 
     // Status
@@ -129,7 +127,16 @@ private:
 
     RotoPdStatus _status = RotoPdStatus::GEEN_PDO;
 
-    // Interrupt
+    // STATUS-poll — geen interrupt meer (zie git-historie: op echte
+    // hardware bleef de AP33772S-INT-pin, in elke geprobeerde
+    // attachInterrupt()-vorm — RISING per ongeluk via HIGH, daarna een
+    // bewuste ONHIGH met detach/attach-cyclus tegen de storm — uiteindelijk
+    // onbetrouwbaar: soms nooit meer een edge/level na de eerste paar
+    // events, dus permanent geen verse READY meer). handleWork() leest nu
+    // gewoon zelf, elke ~1s, ongeacht of er iets te melden is — dat is toch
+    // al de cadans van de AVS/PPS-herbevestiging (_next_avsTick), dus geen
+    // extra I2C-druk t.o.v. de situatie met een goed werkende interrupt.
+    unsigned long _next_statusPoll = 0;
     bool _newPdo = true;
     bool _ready = true;
     unsigned long _started_at = 0;
@@ -166,9 +173,9 @@ private:
     // Uiteindelijke vorm: alleen de spanningsaanvraag zelf (_stuurAan()'s
     // PD_REQMSG-write) zet _i2cVeilig op false — geen enkele andere
     // i2c_read()/i2c_write() raakt 'm nog aan (ook niet bij een
-    // transactiefout). True wordt hij zodra handleWork()'s
-    // interrupt-verwerking een READY-bit ziet, of via een expliciete
-    // reset(). Alle andere I2C (output aan/uit, metingen, PDO-lijst lezen)
+    // transactiefout). True wordt hij zodra handleWork()'s periodieke
+    // STATUS-poll (zie _next_statusPoll) een READY-bit ziet. Alle andere
+    // I2C (output aan/uit, metingen, PDO-lijst lezen)
     // wacht wel op dit veilig-moment om te vuren, maar consumeert het zelf
     // niet — zo lopen de periodieke AVS-herbevestiging en een verse
     // vraagbijstelling (allebei via _stuurAan()) elkaar niet meer in de weg

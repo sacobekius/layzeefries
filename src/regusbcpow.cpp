@@ -45,18 +45,12 @@ void PDOInfo::printTo(Print &p) const {
     }
 }
 
-// Interrupt
-volatile int interruptFlag = 0;
-volatile uint8_t interruptStatus = 0;
+// STATUS-byte van de laatste poll (zie handleWork()'s _next_statusPoll) —
+// geen interrupt meer: op echte hardware bleek de AP33772S-INT-pin in geen
+// enkele geprobeerde attachInterrupt()-vorm betrouwbaar (zie git-historie),
+// dus geen ISR/vlag hier meer nodig.
+uint8_t pdoStatus = 0;
 TwoWire *i2cPort{};
-
-static void handleInterrupt()
-{
-    // Alleen een vlag zetten: I2C-transacties zijn niet veilig binnen een
-    // ISR op ESP32 (Wire gebruikt semaforen, niet ISR-safe). De echte
-    // STATUS-uitlezing gebeurt in handleWork(), in de hoofdloop-context.
-    interruptFlag++;
-}
 
 // Constructor
 regUSBCPow::regUSBCPow(TwoWire &wire) : _readBuf{}, _writeBuf{} {
@@ -69,20 +63,17 @@ regUSBCPow::regUSBCPow(TwoWire &wire) : _readBuf{}, _writeBuf{} {
 }
 
 // Initialisatie
-void regUSBCPow::begin(int i)
+void regUSBCPow::begin()
 {
-    // INPUT_PULLDOWN i.p.v. INPUT: voorkomt een zwevende pin (en dus
-    // interruptstorm) zolang de RotoPD niet aangesloten/gevoed is. PULLUP zou
-    // hier verkeerd zijn: de AP33772S-INT-pin is idle-LOW/actief-HIGH
-    // (datasheet), dus zonder actieve aansturing (geen VBUS) hoort de pin
-    // richting LOW te zakken — met PULLUP zou een ongevoede/losse pin juist
-    // HIGH blijven hangen en een level-HIGH-interrupt continu laten afgaan.
-    pinMode(i, INPUT_PULLDOWN);
-    // De AP33772S-INT-pin is level-triggered en gaat naar HIGH bij een event
-    // (datasheet "Interrupt Signal"-sectie) — geen dalende flank (FALLING),
-    // dat liet interrupts nooit binnenkomen.
-    attachInterrupt(digitalPinToInterrupt(i), handleInterrupt, HIGH);
-
+    // Geen interrupt-pin meer nodig — zie de toelichting bij
+    // _next_statusPoll (header) en handleWork(): STATUS wordt nu elke ~1s
+    // gepolld i.p.v. op een event van de AP33772S-INT-pin te wachten. Op
+    // echte hardware bleek geen enkele geprobeerde attachInterrupt()-vorm
+    // (RISING per ongeluk via HIGH, daarna een bewuste ONHIGH met een
+    // detach/attach-cyclus tegen de storm) betrouwbaar: soms nooit meer een
+    // edge/level na de eerste paar events, dus permanent geen verse READY
+    // meer — precies het mechanisme achter de AVS/PPS-aanvragen die nooit
+    // werden geëffectueerd.
     reset();  // schone herstart van de PD-onderhandeling bij elke boot
 
     _writeBuf[0] = PDO_STARTED | PDO_READY | PDO_NEWPDO;
@@ -408,59 +399,42 @@ void regUSBCPow::printStatus(Print &p) const {
     p.print(gevraagde_voltage);
     p.print("mV, ");
     p.print(gevraagde_stroom);
-    p.print("mA) pdResultaat=");
-    p.print(_gemetenPdResultaat);
-    p.print(" system=0x");
-    p.print(_gemetenSystem, HEX);
-    p.print(" (VOUTCTL=");
-    p.print(_gemetenSystem & 0x03);
-    p.print(") i2cVeilig=");
-    p.print(_i2cVeilig ? "1" : "0");
-    p.print(" meetStap=");
-    p.print(_meetStap);
-    p.print(" config=0x");
-    p.print(_gemetenConfig, HEX);
-    p.print(" (UVP_EN=");
-    p.print((_gemetenConfig & 0x08) ? "1" : "0");
-    p.print(")");
-    p.print(" i2cFoutTeller=");
-    p.print(_i2cFoutTeller);
-    p.print(" ina238FoutTeller=");
-    p.println(_ina238FoutTeller);
+    p.println("mA)");
 }
 
 RotoPdStatus regUSBCPow::handleWork()
 {
     unsigned long now = millis();
 
-    if (interruptFlag > 0)
+    if (now > _next_statusPoll)
     {
-        interruptFlag = 0;
-        // STATUS-uitlezing gebeurt hier (hoofdloop-context), niet meer in de
-        // ISR — lezen reset het register (datasheet: "Reset to 0 after every
-        // Read"), dus dit is de enige plek waar we het mogen lezen.
+        _next_statusPoll = now + 1000;
+        // Geen interrupt meer (zie begin()/header) — gewoon elke ~1s zelf
+        // lezen. Lezen reset het register (datasheet: "Reset to 0 after
+        // every Read").
         i2c_read(CMD_STATUS, 1);
         // Bij falen niets te verwerken (geen geldige data) — de eventuele
         // degradatie naar GEEN_PDO gebeurt hierna centraal, pas na een paar
         // opeenvolgende mislukkingen (zie _i2cFoutTeller).
         if (_trans_stat == 0)
         {
-            interruptStatus = _readBuf[0];
-            // Tijdelijk terug (was eerder uitgezet, zie git-historie): deze
-            // keer specifiek om de nieuwe _i2cVeilig-logica (NEWPDO/fout-bits
-            // vs. een schone READY) op echte hardware te kunnen natrekken.
-            // Vuurt elke ~500ms mee met de AVS-keepalive — zet 'm weer uit
-            // zodra dat bevestigd is en de ruis weer gaat storen.
-            if (interruptStatus == 0x2)
+            pdoStatus = _readBuf[0];
+            // Een schone, geïsoleerde READY (0x2, geen andere bits) wordt
+            // als kale punt afgedrukt — komt bij elke poll voor zolang er
+            // niets bijzonders is, dus voluit "pdoStatus: 0x2" zou de trace
+            // onnodig opblazen. Elke andere waarde (inclusief 0x0) wél
+            // volledig afdrukken, ook zonder bits: dat is zichtbaar bedoeld
+            // gedrag, niet ruis die onderdrukt moet worden.
+            if (pdoStatus == 0x2)
             {
                 console.print('.');
             } else
             {
-                console.print("interruptStatus: 0x");
-                console.println(interruptStatus, HEX);
+                console.print("pdoStatus: 0x");
+                console.println(pdoStatus, HEX);
             }
 
-            if (interruptStatus & (PDO_UVP | PDO_OVP | PDO_OCP | PDO_OTP))
+            if (pdoStatus & (PDO_UVP | PDO_OVP | PDO_OCP | PDO_OTP))
             {
                 // Beveiliging getriggerd: chip schakelt VOUT uit. Datasheet:
                 // "the host MCU will need to load new PD_REQMSG to start a
@@ -468,15 +442,15 @@ RotoPdStatus regUSBCPow::handleWork()
                 // herstel (zie check_mode()'s "pop"), niet hier.
                 _status = RotoPdStatus::PDO_OVERFLOW;
             }
-            else if ((interruptStatus & PDO_READY) && _status == RotoPdStatus::PDO_OVERFLOW)
+            else if ((pdoStatus & PDO_READY) && _status == RotoPdStatus::PDO_OVERFLOW)
             {
                 // Schoon READY-signaal zonder foutbits: hersteld van de
                 // beveiligingstrip.
                 _status = RotoPdStatus::PDO_OK;
             }
-            if (interruptStatus & PDO_NEWPDO)
+            if (pdoStatus & PDO_NEWPDO)
                 _newPdo = true;
-            if (interruptStatus & PDO_READY) {
+            if (pdoStatus & PDO_READY) {
                 _ready = true;
                 // READY betekent veilig, ongeacht welke andere bits in
                 // hetzelfde STATUS-byte meekomen (NEWPDO, foutbits): op
@@ -492,7 +466,7 @@ RotoPdStatus regUSBCPow::handleWork()
                 // teruggegeven.
                 _i2cVeilig = true;
             }
-            if (interruptStatus & PDO_STARTED)
+            if (pdoStatus & PDO_STARTED)
                 _started_at = now + 100;
             // MASK (0x02) is een gewoon RW-configuratieregister, geen
             // Read-to-Clear zoals STATUS (datasheet Table 11/20: geen
@@ -507,7 +481,7 @@ RotoPdStatus regUSBCPow::handleWork()
     // ongeacht wat _status daarvoor toevallig was. Niet vastklinken aan
     // "_status was GEEN_PDO": een reconnect triggert niet altijd (opnieuw)
     // een UVP/OVP/OCP/OTP-bit of I2C-fout onderweg (gezien op echte hardware:
-    // I2C bleef werken, interruptStatus was zelfs 0x0 tijdens het loskoppelen),
+    // I2C bleef werken, pdoStatus was zelfs 0x0 tijdens het loskoppelen),
     // dus _status kan best op PDO_OK zijn blijven staan terwijl er ondertussen
     // wél een volledige her-onderhandeling plaatsvond.
     if (_ready && _newPdo && now > _started_at)
@@ -678,23 +652,6 @@ RotoPdStatus regUSBCPow::handleWork()
     // AVS/PPS-herbevestiging (_stuurAan() beheert _next_avsTick zelf).
     if (_i2cVeilig && (_aansturingGewijzigd || now > _next_avsTick))
     {
-        if (!_aansturingGewijzigd && now > _next_avsTick)
-        {
-            // Puur een periodieke herbevestiging, geen verse wens — log de
-            // status vlak vóórdat we 'm opnieuw versturen, om te zien of de
-            // toestand op dat moment al goed was (bevestigt of de storing
-            // door deze herhaling zelf wordt veroorzaakt).
-            console.print("Vóór herbevestiging: ");
-            printStatus(console);
-        }
-        // Doodlopende weg gebleken: bij een aanhoudende UVP-FAULT een HRST
-        // proberen i.p.v. gewoon de RDO te herhalen. HRST triggert zijn
-        // eigen PDO-herlees, wat _huidigPDOIndex ongeldig maakt totdat de
-        // eerstvolgende (trage) setVoltage() 'm herstelt — en zolang wij
-        // niets versturen, komt er ook geen verse interrupt, dus _i2cVeilig
-        // wordt nooit meer waar: een self-inflicted deadlock. De echte fix
-        // zit in het uitzetten van UVP zelf (zie begin()), niet in hoe we
-        // op de FAULT reageren.
         _stuurAan();
         _aansturingGewijzigd = false;
     }
