@@ -61,7 +61,7 @@ class regUSBCPow {
 public:
     explicit regUSBCPow(TwoWire &wire=Wire);
     // Initialisatie
-    void begin();
+    void begin(int i);
     void srcpdo();
     void reset();  // PD hard reset (PD_CMDMSG.HRST) — dwingt een schone herstart van de PD-onderhandeling af
 
@@ -127,15 +127,13 @@ private:
 
     RotoPdStatus _status = RotoPdStatus::GEEN_PDO;
 
-    // STATUS-poll — geen interrupt meer (zie git-historie: op echte
-    // hardware bleef de AP33772S-INT-pin, in elke geprobeerde
-    // attachInterrupt()-vorm — RISING per ongeluk via HIGH, daarna een
-    // bewuste ONHIGH met detach/attach-cyclus tegen de storm — uiteindelijk
-    // onbetrouwbaar: soms nooit meer een edge/level na de eerste paar
-    // events, dus permanent geen verse READY meer). handleWork() leest nu
-    // gewoon zelf, elke ~1s, ongeacht of er iets te melden is — dat is toch
-    // al de cadans van de AVS/PPS-herbevestiging (_next_avsTick), dus geen
-    // extra I2C-druk t.o.v. de situatie met een goed werkende interrupt.
+    // Garandeert een verse STATUS-read elke ~1s, ongeacht of de interrupt
+    // (zie handleInterrupt() in de .cpp) meewerkt — die mag deze read
+    // alleen vervroegen (interruptFired), niet vervangen. Zie git-historie:
+    // op echte hardware bleek geen enkele geprobeerde attachInterrupt()-
+    // vorm betrouwbaar genoeg om er blind op te vertrouwen (soms nooit meer
+    // een edge/level na de eerste paar events), dus deze klok is de
+    // eigenlijke garantie.
     unsigned long _next_statusPoll = 0;
     bool _newPdo = true;
     bool _ready = true;
@@ -163,25 +161,25 @@ private:
     bool _srcpdoGewenst = false;
     bool _srcpdoIsPrimair = false;
 
-    // STATUS.READY is Read-to-Clear (datasheet: "1: Ready to receive I2C
-    // request/command"). Eerder dit project geprobeerd als een eenmalig
-    // token dat élk commando (of alleen elk schrijf-commando) zelf verbruikt
-    // — beide varianten bleken op echte hardware een dood punt te
-    // veroorzaken (zie git-historie): een gewone PD_REQMSG-write bleek niet
-    // altijd betrouwbaar gevolgd te worden door een nieuwe READY-interrupt,
-    // dus bleef alles na de eerste write soms voor altijd geblokkeerd.
+    // Eerder gekoppeld aan specifiek de STATUS.READY-bit (datasheet: "1:
+    // Ready to receive I2C request/command") — bleek op echte hardware met
+    // een 1s-poll te streng: STATUS levert nog vaak 0x0 op (geen enkele bit
+    // gezet), dan bleef _i2cVeilig onterecht lang false terwijl er niets
+    // mis was, alleen toevallig geen nieuw event tussen twee polls in.
     // Uiteindelijke vorm: alleen de spanningsaanvraag zelf (_stuurAan()'s
     // PD_REQMSG-write) zet _i2cVeilig op false — geen enkele andere
     // i2c_read()/i2c_write() raakt 'm nog aan (ook niet bij een
     // transactiefout). True wordt hij zodra handleWork()'s periodieke
-    // STATUS-poll (zie _next_statusPoll) een READY-bit ziet. Alle andere
-    // I2C (output aan/uit, metingen, PDO-lijst lezen)
-    // wacht wel op dit veilig-moment om te vuren, maar consumeert het zelf
-    // niet — zo lopen de periodieke AVS-herbevestiging en een verse
-    // vraagbijstelling (allebei via _stuurAan()) elkaar niet meer in de weg
-    // via een omweg langs een ongerelateerd write-commando. Losstaand van
-    // _ready, die een eigen betekenis heeft (PDO-lijst-herlees-gate) en niet
-    // verstoord mag worden.
+    // STATUS-poll (zie _next_statusPoll) zélf slaagt — die geslaagde
+    // transactie bewijst al dat de chip reageert, ongeacht welke bits het
+    // gelezen STATUS-byte draagt. Alle andere I2C (output aan/uit, metingen,
+    // PDO-lijst lezen) wacht wel op dit veilig-moment om te vuren, maar
+    // consumeert het zelf niet — zo lopen de periodieke AVS-herbevestiging
+    // en een verse vraagbijstelling (allebei via _stuurAan()) elkaar niet
+    // meer in de weg via een omweg langs een ongerelateerd write-commando.
+    // Losstaand van _ready, die een eigen betekenis heeft
+    // (PDO-lijst-herlees-gate, specifiek wél aan de READY-bit gekoppeld) en
+    // niet verstoord mag worden.
     bool _i2cVeilig = false;
 
     // Gecachte meetwaarden — één register per _i2cVeilig-beurt door

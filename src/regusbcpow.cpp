@@ -45,12 +45,33 @@ void PDOInfo::printTo(Print &p) const {
     }
 }
 
-// STATUS-byte van de laatste poll (zie handleWork()'s _next_statusPoll) —
-// geen interrupt meer: op echte hardware bleek de AP33772S-INT-pin in geen
-// enkele geprobeerde attachInterrupt()-vorm betrouwbaar (zie git-historie),
-// dus geen ISR/vlag hier meer nodig.
+// STATUS-byte van de laatste poll (zie handleWork()'s _next_statusPoll).
 uint8_t pdoStatus = 0;
 TwoWire *i2cPort{};
+
+// De interrupt is hier terug, maar nu puur als snelheidsbonus bovenop de
+// 1s-poll (zie handleWork()) — niet meer als enige bron van een verse
+// STATUS-read zoals eerder dit project (zie git-historie: op echte
+// hardware bleek geen enkele attachInterrupt()-vorm betrouwbaar genoeg om
+// daar blind op te vertrouwen, dus _i2cVeilig kon permanent false blijven
+// hangen). Nu geldt: komt de interrupt binnen, dan poll je meteen i.p.v.
+// tot een volle seconde te wachten; blijft-ie een keer uit (zoals eerder
+// gebeurde), dan pakt de gewone 1s-poll het gewoon weer op — geen enkel
+// pad hangt hier nog van af.
+static int interruptPin = -1;
+volatile bool interruptFired = false;
+
+static void handleInterrupt()
+{
+    // Detach meteen: de AP33772S-INT-pin is level-triggered (blijft HIGH
+    // tot STATUS is uitgelezen), dus zonder detach zou een level-trigger
+    // non-stop opnieuw afgaan totdat handleWork() aan de STATUS-read
+    // toekomt (I2C is niet ISR-safe, kan dus niet hier) — precies de
+    // interrupt-storm die eerder al een keer het board onbereikbaar maakte.
+    // handleWork() doet weer attach() nadat de poll is afgehandeld.
+    detachInterrupt(interruptPin);
+    interruptFired = true;
+}
 
 // Constructor
 regUSBCPow::regUSBCPow(TwoWire &wire) : _readBuf{}, _writeBuf{} {
@@ -63,17 +84,22 @@ regUSBCPow::regUSBCPow(TwoWire &wire) : _readBuf{}, _writeBuf{} {
 }
 
 // Initialisatie
-void regUSBCPow::begin()
+void regUSBCPow::begin(int i)
 {
-    // Geen interrupt-pin meer nodig — zie de toelichting bij
-    // _next_statusPoll (header) en handleWork(): STATUS wordt nu elke ~1s
-    // gepolld i.p.v. op een event van de AP33772S-INT-pin te wachten. Op
-    // echte hardware bleek geen enkele geprobeerde attachInterrupt()-vorm
-    // (RISING per ongeluk via HIGH, daarna een bewuste ONHIGH met een
-    // detach/attach-cyclus tegen de storm) betrouwbaar: soms nooit meer een
-    // edge/level na de eerste paar events, dus permanent geen verse READY
-    // meer — precies het mechanisme achter de AVS/PPS-aanvragen die nooit
-    // werden geëffectueerd.
+    // INPUT_PULLDOWN i.p.v. INPUT: voorkomt een zwevende pin (en dus een
+    // valse interrupt) zolang de RotoPD niet aangesloten/gevoed is. PULLUP
+    // zou hier verkeerd zijn: de AP33772S-INT-pin is idle-LOW/actief-HIGH
+    // (datasheet), dus zonder actieve aansturing (geen VBUS) hoort de pin
+    // richting LOW te zakken.
+    pinMode(i, INPUT_PULLDOWN);
+    interruptPin = digitalPinToInterrupt(i);
+    // ONHIGH: echte level-trigger, matcht de datasheet ("Interrupt Signal").
+    // De detach/attach-cyclus (zie handleInterrupt()/handleWork()) voorkomt
+    // de storm die een kale ONHIGH eerder gaf. Maar zelfs met die cyclus is
+    // dit alleen nog een snelheidsbonus bovenop de 1s-poll — zie de
+    // toelichting hierboven bij interruptFired.
+    attachInterrupt(interruptPin, handleInterrupt, ONHIGH);
+
     reset();  // schone herstart van de PD-onderhandeling bij elke boot
 
     _writeBuf[0] = PDO_STARTED | PDO_READY | PDO_NEWPDO;
@@ -406,12 +432,14 @@ RotoPdStatus regUSBCPow::handleWork()
 {
     unsigned long now = millis();
 
-    if (now > _next_statusPoll)
+    if (now > _next_statusPoll || interruptFired)
     {
         _next_statusPoll = now + 1000;
-        // Geen interrupt meer (zie begin()/header) — gewoon elke ~1s zelf
-        // lezen. Lezen reset het register (datasheet: "Reset to 0 after
-        // every Read").
+        interruptFired = false;
+        // De 1s-cadans is de garantie (zie het commentaar bij
+        // interruptFired hierboven); een binnengekomen interrupt mag deze
+        // read alleen vervroegen. Lezen reset het register (datasheet:
+        // "Reset to 0 after every Read").
         i2c_read(CMD_STATUS, 1);
         // Bij falen niets te verwerken (geen geldige data) — de eventuele
         // degradatie naar GEEN_PDO gebeurt hierna centraal, pas na een paar
@@ -419,16 +447,27 @@ RotoPdStatus regUSBCPow::handleWork()
         if (_trans_stat == 0)
         {
             pdoStatus = _readBuf[0];
-            // Een schone, geïsoleerde READY (0x2, geen andere bits) wordt
-            // als kale punt afgedrukt — komt bij elke poll voor zolang er
-            // niets bijzonders is, dus voluit "pdoStatus: 0x2" zou de trace
-            // onnodig opblazen. Elke andere waarde (inclusief 0x0) wél
-            // volledig afdrukken, ook zonder bits: dat is zichtbaar bedoeld
-            // gedrag, niet ruis die onderdrukt moet worden.
+            // Deze STATUS-poll zelf is een geslaagde I2C-transactie met de
+            // AP33772S — dat alleen al bewijst dat de chip nu reageert, dus
+            // veilig genoeg om ook te schrijven. Eerder stond dit gekoppeld
+            // aan specifiek de READY-bit in dit STATUS-byte, maar die bleek
+            // op echte hardware met een 1s-poll nog vaak 0x0 op te leveren
+            // (geen enkele bit gezet) — dan bleef _i2cVeilig onnodig lang
+            // false terwijl er niets mis was, alleen toevallig geen nieuw
+            // event tussen twee polls in. PDO_READY hieronder blijft wel
+            // los bestaan voor zijn eigen betekenis (_ready, gekoppeld aan
+            // _newPdo voor het herlezen van de PDO-lijst).
+            _i2cVeilig = true;
+            // 0x2 (kale READY) is een echt, betekenisvol event — als kale
+            // punt afgedrukt, anders zou de trace bij elke poll opblazen.
+            // 0x0 (niets gezet) is iets anders: geen event, gewoon een poll
+            // die toevallig niets te melden had — dat is geen READY en
+            // helemaal niet printen, ook niet als punt. Elke andere waarde
+            // (foutbits, NEWPDO, STARTED) wél volledig afdrukken.
             if (pdoStatus == 0x2)
             {
                 console.print('.');
-            } else
+            } else if (pdoStatus != 0x0)
             {
                 console.print("pdoStatus: 0x");
                 console.println(pdoStatus, HEX);
@@ -451,20 +490,10 @@ RotoPdStatus regUSBCPow::handleWork()
             if (pdoStatus & PDO_NEWPDO)
                 _newPdo = true;
             if (pdoStatus & PDO_READY) {
+                // _ready is los van _i2cVeilig: dit stuurt alleen het
+                // herlezen van de PDO-lijst aan (samen met _newPdo), geen
+                // schrijf-veiligheid meer — zie hierboven.
                 _ready = true;
-                // READY betekent veilig, ongeacht welke andere bits in
-                // hetzelfde STATUS-byte meekomen (NEWPDO, foutbits): op
-                // echte hardware zijn NEWPDO en READY zowel los na elkaar
-                // als samen in één byte gezien (afhankelijk van hoe snel
-                // handleWork() de STATUS-read oppakt) — READY negeren
-                // zodra er iets anders bij staat zou kunnen betekenen dat
-                // we wachten op een aparte, latere READY die op deze
-                // hardware soms nooit los voorkomt. Zonder een READY-bit
-                // blijft _i2cVeilig hoe dan ook al false: die is aan het
-                // begin van deze STATUS-read zelf al onvoorwaardelijk
-                // verbruikt (i2c_read()) en wordt alleen hier weer
-                // teruggegeven.
-                _i2cVeilig = true;
             }
             if (pdoStatus & PDO_STARTED)
                 _started_at = now + 100;
@@ -476,6 +505,14 @@ RotoPdStatus regUSBCPow::handleWork()
             // zonder op een verse READY te wachten voor dat tweede
             // commando — precies het patroon dat we nu juist vermijden.
         }
+        // Weer attach() — ongeacht of de poll hierboven via de 1s-klok dan
+        // wel de interrupt kwam, en ongeacht of de STATUS-read slaagde: bij
+        // een falende read willen we ook niet doof blijven voor de
+        // volgende interrupt (de 1s-poll ving dat sowieso al op, maar dan
+        // zonder de snelheidsbonus). Staat de pin nu nog HIGH (event nog
+        // niet echt gecleard), dan vuurt de ISR gewoon meteen opnieuw —
+        // geen storm, want handleInterrupt() zelf detacht meteen weer.
+        attachInterrupt(interruptPin, handleInterrupt, ONHIGH);
     }
     // Een vers NEWPDO-signaal betekent altijd: PDO-lijst opnieuw inlezen —
     // ongeacht wat _status daarvoor toevallig was. Niet vastklinken aan
