@@ -72,8 +72,8 @@ public:
     // Meten — gecachte waarden, ~1x/seconde bijgewerkt door handleWork()
     // (niet meer een directe I2C-read per aanroep — alle operationele I2C
     // zit geconcentreerd in handleWork(), zie de private members hieronder).
-    unsigned int leesVoltage() const;         // mV, 80mV/LSB
-    unsigned int leesStroom() const;          // mA, 24mA/LSB
+    unsigned int leesVoltage() const;         // mV — via de INA238, zie toelichting bij _gemetenVoltage_mV
+    int leesStroom() const;                   // ruwe (signed) INA238-registerwaarde, GEEN geijkte mA — zie toelichting bij _gemetenStroom_mA
     unsigned int leesVREQ() const;            // mV, aangevraagde spanning
     unsigned int leesIREQ() const;            // mA, aangevraagde stroom
     int leesTemp();                           // °C — buiten scope, nog directe I2C (ongebruikt)
@@ -180,8 +180,28 @@ private:
     // Gecachte meetwaarden — één register per _i2cVeilig-beurt door
     // handleWork() ververst (zie _meetStap), volledige cyclus ~1x/seconde
     // gestart. Zie leesVoltage()/leesStroom()/leesVREQ()/leesIREQ().
+    //
+    // _gemetenVoltage_mV/_gemetenStroom_mA komen sinds de RotoPD Pro NIET
+    // meer van de AP33772S zelf, maar van de losse INA238-vermogensmonitor
+    // die op dit board naast de AP33772S zit (ander I2C-adres, 0x40,
+    // bevestigd via MANUFACTURER_ID=0x5449="TI"). Reden: de AP33772S's
+    // eigen VOLTAGE-register bleek op echte hardware op sommige momenten
+    // niet mee te bewegen met de daadwerkelijke VOUT (bv. bleef 4960mV
+    // tonen terwijl een multimeter én de INA238 tegelijk 8.8V+ maten,
+    // gevraagd/onderhandeld was ook echt 9V — pdResultaat=succes) — en de
+    // AP33772S's CURRENT liet exact hetzelfde patroon zien: bleef letterlijk
+    // elke trace op 168mA staan, ongeacht spanning/belasting, terwijl de
+    // INA238's eigen CURRENT-register wél meebewoog (0→740→1105 etc.) toen
+    // die nog los werd uitgelezen.
+    // Let op: _gemetenStroom_mA is voorlopig de RUWE (signed) INA238-
+    // registerwaarde, GEEN geijkte mA — dat vereist het CAL-register
+    // (shunt-kalibratie), en die weerstandswaarde van dit specifieke board
+    // kennen we nog niet. Bruikbaar om trends/verandering te zien, niet als
+    // absolute stroom. Signed (int, niet unsigned): bij een lage/nul
+    // belasting kan de ruwe ADC-lezing best een fractie onder 0 uitkomen
+    // (ruis) — als unsigned zou dat naar een absurd groot getal wrappen.
     unsigned int _gemetenVoltage_mV = 0;
-    unsigned int _gemetenStroom_mA = 0;
+    int _gemetenStroom_mA = 0;
     unsigned int _gemetenVREQ_mV = 0;
     unsigned int _gemetenIREQ_mA = 0;
     // Resultaat van de laatste PD_REQMSG/PD_CMDMSG (PD_MSGRLT.RESPONSE,
@@ -195,10 +215,14 @@ private:
     // write ook echt is aangekomen zoals bedoeld, in plaats van blind op
     // onze eigen _gewildOutputAan-intentie te vertrouwen.
     uint8_t _gemetenSystem = 0;
+    // Teruggelezen CONFIG-register (0x04) — om te bevestigen dat UVP_EN
+    // (bit 3) daadwerkelijk uitstaat, i.p.v. blind op de write in
+    // srcpdo() te vertrouwen (die kan net zo goed een keer stil falen).
+    uint8_t _gemetenConfig = 0;
     unsigned long _next_meetTick = 0;
-    // 0=VOLTAGE, 1=CURRENT, 2=VREQ, 3=IREQ, 4=PD_MSGRLT, 5=SYSTEM — welke meting
-    // handleWork() als eerstvolgende oppakt zodra er weer een veilig moment
-    // is.
+    // 0=VOLTAGE (INA238), 1=CURRENT (INA238), 2=VREQ, 3=IREQ, 4=PD_MSGRLT,
+    // 5=SYSTEM, 6=CONFIG — welke meting handleWork() als eerstvolgende
+    // oppakt zodra er weer een veilig moment is.
     uint8_t _meetStap = 0;
 
     // Verificatie dat een aanvraag (_stuurAan()) ook echt is gehonoreerd:
@@ -218,9 +242,9 @@ private:
     bool _gewildOutputAan = false;
     bool _outputWijzigingGewenst = false;
 
-    // I2C
-    // AP3377S i2c adres
-    void i2c_read(uint8_t cmd, uint8_t len);
+    // I2C — slaveAddr default is de AP33772S zelf; de INA238-lezingen
+    // (andere chip, ander adres, zie hierboven) geven hun eigen adres mee.
+    void i2c_read(uint8_t cmd, uint8_t len, uint8_t slaveAddr = AP33772S_ADDRESS);
     void i2c_write(uint8_t cmd, uint8_t len);
     byte _trans_stat = 0;
     // Aantal ACHTEREENVOLGENDE mislukte I2C-transacties (opgeteld in
@@ -229,8 +253,14 @@ private:
     // pas naar RotoPdStatus::GEEN_PDO als dit een drempel haalt, niet al bij
     // de eerste de beste NACK: op echte hardware bleek een losse, transiënte
     // mislukking (bv. net de STATUS-read) geen betrouwbaar signaal dat de
-    // PDO echt weg is — de rest bleef gewoon werken.
+    // PDO echt weg is — de rest bleef gewoon werken. Telt alleen AP33772S-
+    // transacties (i2c_read()/i2c_write() met slaveAddr==AP33772S_ADDRESS)
+    // — dit stuurt _status aan, dus een INA238-fout hoort hier niet in mee
+    // te tellen (zie _ina238FoutTeller).
     int _i2cFoutTeller = 0;
+    // Zelfde tel-principe, maar los, voor de INA238 (ander chip, andere
+    // gezondheid) — puur zichtbaar via printStatus(), stuurt niets aan.
+    int _ina238FoutTeller = 0;
 
     uint8_t _readBuf[32];
     uint8_t _writeBuf[8];
@@ -290,6 +320,12 @@ private:
 
     SRC_SPRandEPR_PDO_Fields _srcPDOs[13]{};
 
+    // I2C-adressen — hier (i.p.v. losse file-scope constanten in de .cpp)
+    // zodat i2c_read()'s default-parameter hierboven hetzelfde symbool kan
+    // hergebruiken i.p.v. een los magic number.
+    static constexpr uint8_t AP33772S_ADDRESS = 0x52;
+    static constexpr uint8_t INA238_ADDRESS   = 0x40;
+
     // Status en configuratie
     static constexpr uint8_t CMD_STATUS   = 0x01; // Reset to 0 after every Read
     static constexpr uint8_t CMD_MASK     = 0x02;
@@ -304,9 +340,9 @@ private:
     static constexpr uint8_t CMD_TR75     = 0x0E;
     static constexpr uint8_t CMD_TR100    = 0x0F;
 
-    // Vermogen meting
-    static constexpr uint8_t CMD_VOLTAGE  = 0x11;
-    static constexpr uint8_t CMD_CURRENT  = 0x12;
+    // Vermogen meting — VOLTAGE (0x11)/CURRENT (0x12) van de AP33772S zelf
+    // niet meer gebruikt: beide komen nu van de INA238, zie de toelichting
+    // bij _gemetenVoltage_mV/_gemetenStroom_mA hierboven.
     static constexpr uint8_t CMD_TEMP     = 0x13;
     static constexpr uint8_t CMD_VREQ     = 0x14;
     static constexpr uint8_t CMD_IREQ     = 0x15;

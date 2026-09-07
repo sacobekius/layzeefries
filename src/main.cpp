@@ -40,7 +40,7 @@
 #define DOEL_TEMPERATUUR_FALLBACK_C 10.0  // gebruikt zolang NVS nog geen echte capture heeft
 #define PID_KP 1000.0             // mV per graad afwijking — bij fout=13C al verzadigd op het maximum (was 500, te traag naar vol vermogen)
 #define PID_KI_PER_TICK 250.0     // mV integraal-opbouw per graad fout, per bepaalAansturing()-aanroep (~elke 60s) — was 50, te traag bij het laatste stukje vlak bij het doel; grote fouten (>3C) komen hier toch niet, die vangt de vriezerregelaar's actieve vraag al af
-#define PID_STROOM_MA 3500        // vast voor nu, alleen de spanning wordt geregeld — Peltiers verdragen tot 7000mA, 3000 bleek te krap (OCP-trip bij een richtingwissel)
+#define PID_STROOM_MA 5000        // vast voor nu, alleen de spanning wordt geregeld — Peltiers verdragen tot 7000mA, 3000 bleek te krap (OCP-trip bij een richtingwissel)
 // Bij het loslaten van een vraag (koude_vraag/warmte_vraag) valt de fout
 // terug naar ~0 — zonder meer zou de regeling dan in één klap van vol
 // vermogen naar bijna niets springen, en dat bleek in de praktijk veel te
@@ -127,6 +127,18 @@ bool was_grote_fout = false;
 int huidige_richting = -1;
 // Integraal-opbouw van de PID, in mV.
 float pid_integraal_mV = 0;
+// Eigen, trage klok specifiek voor de I-opbouw (zie bepaalAansturing()) —
+// losgekoppeld van hoe vaak bepaalAansturing() zelf wordt aangeroepen. Die
+// laatste mag nu vaker (vraagTick(), elke ~1s) om snel op een grote fout te
+// reageren, maar PID_KI_PER_TICK is getuned op ~60s per opbouw-stap; zonder
+// deze eigen klok zou de integraal 60x te snel oplopen.
+unsigned long next_pid_tick = 0;
+// Eigen, tragere klok specifiek voor de "Aansturing: ..."-logregel in
+// bepaalAansturing(). Sinds vraagTick() elke ~1s toepast (zie hierboven)
+// zou dit anders elke seconde opnieuw printen — bij een aanhoudende grote
+// fout (bv. tijdens deze AVS-diagnose) genoeg volume om de BLE-verbinding
+// te verstoppen (bufferophoping/herhaling). Loggen mag trager dan toepassen.
+unsigned long next_log_tick = 0;
 // Welke LED het vermogen-knipperpatroon toont: LEDBLAUW bij koelen, LEDGEEL
 // bij verwarmen, -1 = geen (bv. FOUT/UIT). pasAansturingToe() zet 'm bij
 // elke richtingwissel en wist het knipperplan van de vorige LED, anders
@@ -307,11 +319,17 @@ Aansturing bepaalAansturing()
     int richting = koude_stand ? MODE_KOELEN
                   : warmte_stand ? MODE_VERWARMEN
                   : (fout > 0 ? MODE_KOELEN : MODE_VERWARMEN);
-    console.print("Aansturing: ");
-    console.print((koude_stand || warmte_stand) ? "actieve vraag" : "grote fout");
-    console.print(" -> ");
-    console.print(richting == MODE_KOELEN ? "KOELEN " : "VERWARMEN ");
-    console.println(voltageMax);
+    unsigned long now = millis();
+    if (now > next_log_tick) {
+      next_log_tick = now + 5000;
+      console.print("[");
+      console.print(now);
+      console.print("] Aansturing: ");
+      console.print((koude_stand || warmte_stand) ? "actieve vraag" : "grote fout");
+      console.print(" -> ");
+      console.print(richting == MODE_KOELEN ? "KOELEN " : "VERWARMEN ");
+      console.println(voltageMax);
+    }
     return { richting, voltageMax, (unsigned int) PID_STROOM_MA, 100, 100 };
   }
 
@@ -322,9 +340,17 @@ Aansturing bepaalAansturing()
   // vraagTick()) i.p.v. hier vanaf 0 te beginnen.
   float grens = voltageMax - voltageMin;
 
-  pid_integraal_mV += PID_KI_PER_TICK * fout;
-  if (pid_integraal_mV < -grens) pid_integraal_mV = -grens;
-  if (pid_integraal_mV > grens) pid_integraal_mV = grens;
+  // Alleen de I-opbouw zelf aan de trage 60s-klok binden (zie
+  // next_pid_tick hierboven) — bepaalAansturing() als geheel mag vaker
+  // aangeroepen worden, de P-term en de rest van deze functie zijn een
+  // pure functie van de actuele fout en hebben geen cadans-eis.
+  unsigned long now = millis();
+  if (now > next_pid_tick) {
+    next_pid_tick = now + 60000;
+    pid_integraal_mV += PID_KI_PER_TICK * fout;
+    if (pid_integraal_mV < -grens) pid_integraal_mV = -grens;
+    if (pid_integraal_mV > grens) pid_integraal_mV = grens;
+  }
 
   float correctie = PID_KP * fout + pid_integraal_mV;  // signed
   if (correctie < -grens) correctie = -grens;
@@ -347,19 +373,24 @@ Aansturing bepaalAansturing()
         (float) (vermogen_percentage - FAN_COMFORT_GRENS_PCT) / (100 - FAN_COMFORT_GRENS_PCT) * (100 - FAN_COMFORT));
   }
 
-  console.print("Aansturing: fout=");
-  console.print(fout);
-  console.print("C  I=");
-  console.print(pid_integraal_mV);
-  console.print("mV -> ");
-  console.print(richting == MODE_KOELEN ? "KOELEN " : "VERWARMEN ");
-  console.print("fan=");
-  console.print(fan_percentage);
-  console.print("% spanning=");
-  console.print(voltage);
-  console.print("mV (");
-  console.print(vermogen_percentage);
-  console.println("% van max)");
+  if (now > next_log_tick) {
+    next_log_tick = now + 5000;
+    console.print("[");
+    console.print(now);
+    console.print("] Aansturing: fout=");
+    console.print(fout);
+    console.print("C  I=");
+    console.print(pid_integraal_mV);
+    console.print("mV -> ");
+    console.print(richting == MODE_KOELEN ? "KOELEN " : "VERWARMEN ");
+    console.print("fan=");
+    console.print(fan_percentage);
+    console.print("% spanning=");
+    console.print(voltage);
+    console.print("mV (");
+    console.print(vermogen_percentage);
+    console.println("% van max)");
+  }
 
   return { richting, voltage, (unsigned int) PID_STROOM_MA, fan_percentage, vermogen_percentage };
 }
@@ -426,23 +457,28 @@ void vraagTick()
   int vorige_warmte_stand = warmte_stand;
   koude_stand = !digitalRead(KOUDE_VRAAG);
   warmte_stand = !digitalRead(WARMTE_VRAAG);
-  if (koude_stand == vorige_koude_stand && warmte_stand == vorige_warmte_stand)
-    return;
 
-  bool was_actief = vorige_koude_stand || vorige_warmte_stand;
-  bool nu_actief = koude_stand || warmte_stand;
-  if (was_actief && !nu_actief) {
-    doel_temperatuur = huidige_temperatuur - (vorige_koude_stand ? +1.0 : -1.0);
-    // Startwaarde voor de integraal i.p.v. een reset naar 0 — zie
-    // berekenAfschaalSeed(). Dooft niet uit, de normale I-opbouw stelt 'm
-    // verder bij op de daadwerkelijke fout.
-    pid_integraal_mV = berekenAfschaalSeed(usbpd.leesMaxVoltage());
-    prefs.putFloat("doelC", doel_temperatuur);
-    console.print("Doeltemperatuur bijgewerkt: ");
-    console.print(doel_temperatuur);
-    console.println("C");
+  if (koude_stand != vorige_koude_stand || warmte_stand != vorige_warmte_stand) {
+    bool was_actief = vorige_koude_stand || vorige_warmte_stand;
+    bool nu_actief = koude_stand || warmte_stand;
+    if (was_actief && !nu_actief) {
+      doel_temperatuur = huidige_temperatuur - (vorige_koude_stand ? +1.0 : -1.0);
+      // Startwaarde voor de integraal i.p.v. een reset naar 0 — zie
+      // berekenAfschaalSeed(). Dooft niet uit, de normale I-opbouw stelt 'm
+      // verder bij op de daadwerkelijke fout.
+      pid_integraal_mV = berekenAfschaalSeed(usbpd.leesMaxVoltage());
+      prefs.putFloat("doelC", doel_temperatuur);
+      console.print("Doeltemperatuur bijgewerkt: ");
+      console.print(doel_temperatuur);
+      console.println("C");
+    }
   }
 
+  // Elke ~1s opnieuw toepassen, niet alleen bij een gewijzigde vraag: een
+  // actieve vraag/grote fout loopt via bepaalAansturing()'s bang-bang-tak,
+  // die de PID-integraal niet aanraakt (zie next_pid_tick daar) — vaker
+  // aanroepen dan de trage 60s-cadans is dus veilig, en voorkomt dat de
+  // eerste/eerstvolgende sturing tot een volle minuut op zich laat wachten.
   pasAansturingToe(bepaalAansturing());
 }
 
@@ -517,7 +553,7 @@ void wifiOtaSetup()
 
 void setup() {
   Wire.begin();
-  usbpd.begin(ROTOPD_INT);
+  usbpd.begin(ROTOPD_INT);  // print o.a. de INA238 MANUFACTURER_ID-check
 
   prefs.begin("layzee", false);
   doel_temperatuur = prefs.getFloat("doelC", DOEL_TEMPERATUUR_FALLBACK_C);
@@ -579,6 +615,12 @@ void setup() {
 unsigned long next_vraagTick = 0;
 unsigned long next_temperatuurTick = 0;
 unsigned long next_ledTick = 0;
+// Los van temperatuurTick()'s trage 60s-cadans: sturing reageert sinds
+// vraagTick() al binnen ~1s, maar printStatus() zelf leest alleen al
+// gecachte waarden (geen eigen I2C) — geen reden om de rapportage daarvan
+// nog aan diezelfde 60s vast te binden. Zo kun je ook direct na het sturen
+// meten, i.p.v. tot een minuut wachten.
+unsigned long next_status_tick = 0;
 
 void loop() {
   if (testSucces)
@@ -588,24 +630,30 @@ void loop() {
     huidige_pdo_status = usbpd.handleWork();
     bleSerial.tick();
     esp_task_wdt_reset();
-    if (!check_fout()) {
-      if (now > next_vraagTick) {
-        next_vraagTick = now + 1000;
-        vraagTick();
-      }
-      if (now > next_temperatuurTick) {
-        next_temperatuurTick = now + 60000;
-        temperatuurTick();
-        pasAansturingToe(bepaalAansturing());
-        // Na pasAansturingToe(): dat is de enige plek die spanning/stroom
-        // daadwerkelijk wijzigt, dus hier — en niet op een eigen, losse
-        // timer — is het moment om te rapporteren wat dat opleverde.
-        usbpd.printStatus(console);
-      }
-      if (now > next_ledTick) {
-        next_ledTick = now + 200;
-        ledTick();
-      }
+    // TIJDELIJK, voor de AVS-diagnose: check_fout() nog wel aanroepen (rode
+    // LED/in_fout blijven zichtbaar), maar niet meer als poort gebruiken om
+    // de rest over te slaan. Anders stopt alle meting/print zodra de FAULT
+    // toeslaat — precies het moment dat we willen zien. Gevolg: de regellus
+    // blijft de mislukte AVS-aanvraag steeds opnieuw proberen i.p.v. veilig
+    // uit te blijven staan — bewust, voor deze diagnostische sessie, niet
+    // het gewenste eindgedrag.
+    check_fout();
+    if (now > next_vraagTick) {
+      next_vraagTick = now + 1000;
+      vraagTick();
+    }
+    if (now > next_temperatuurTick) {
+      next_temperatuurTick = now + 60000;
+      temperatuurTick();
+      pasAansturingToe(bepaalAansturing());
+    }
+    if (now > next_status_tick) {
+      next_status_tick = now + 5000;
+      usbpd.printStatus(console);
+    }
+    if (now > next_ledTick) {
+      next_ledTick = now + 200;
+      ledTick();
     }
   } else
   {
