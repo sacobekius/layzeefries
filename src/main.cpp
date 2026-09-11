@@ -155,8 +155,30 @@ struct ledPlan ledPlannen[4];
 int aantalLedPlannen = 0;
 int ledMoment = 0;
 
+void setLedPlan(int led, int deel);  // forward-declaratie: ledTick() hieronder gebruikt 'm al, definitie staat verderop
+
+bool roodKnipperActief = false;
+
 void ledTick()
 {
+  // Kort rood knipperen (via hetzelfde setLedPlan()/deel-mechanisme als
+  // blauw/geel) als de BLE-advertentie na een disconnect niet opnieuw kon
+  // starten (zie bleSerial.h) — geen console-logging mogelijk op dit board,
+  // dus dit is de enige melding. BLE-storing en RotoPD-storing zijn
+  // wezenlijk verschillend — de RotoPD-kant (steady aan, zie check_fout())
+  // overheerst altijd: hier dus alleen iets doen zolang er geen actieve
+  // in_fout is, en check_fout() zet roodKnipperActief zelf terug op false
+  // zodra een RotoPD-fout toeslaat.
+  if (!in_fout) {
+    if (roodKnipperActief) {
+      setLedPlan(LEDROOD, 0);
+      roodKnipperActief = false;
+    } else if (bleSerial.heradverterenMislukt()) {
+      setLedPlan(LEDROOD, 1);
+      roodKnipperActief = true;
+    }
+  }
+
   for (int ledPlanI = 0; ledPlanI < aantalLedPlannen; ledPlanI++) {
     if (ledMoment > ledPlannen[ledPlanI].deel && ledPlannen[ledPlanI].aan) {
       ledUit(ledPlannen[ledPlanI].led);
@@ -503,10 +525,11 @@ bool check_fout()
     huidige_richting = -1;  // volgende pasAansturingToe() moet alles opnieuw zetten
     ledUit(LEDBLAUW);
     ledUit(LEDGEEL);
-    ledAan(LEDROOD);
+    setLedPlan(LEDROOD, 10);  // steady aan; overheerst een eventueel lopende BLE-knipper (zie ledTick())
+    roodKnipperActief = false;
   } else if (!rotopd_fout && in_fout) {
     in_fout = false;
-    ledUit(LEDROOD);
+    setLedPlan(LEDROOD, 0);
   }
 
   return in_fout;
@@ -583,6 +606,16 @@ void setup() {
   testLed(LEDGEEL);
   testLed(LEDGROEN);
   testLed(LEDROOD);
+
+  // Hartslag op LEDGROEN: deel=1 geeft via de bestaande ledTick()-lus een
+  // korte blip (ledMoment<=1 van de 10, dus ~1/10 van elke 2s-cyclus) die
+  // los staat van blauw/geel — puur bewijs dat ledTick() (en dus loop())
+  // nog daadwerkelijk doorloopt. Geen console-logging mogelijk op dit
+  // board, dus dit is de enige manier om "vastgelopen" te onderscheiden van
+  // "gewenst 100%-vermogen" (dan blijft blauw óók continu aan): dooft groen
+  // mee, dan is de hoofdlus zelf gestopt; blijft groen doorknipperen, dan
+  // is dat laatste gewoon een bang-bang-episode op vol vermogen.
+  setLedPlan(LEDGROEN, 1);
 
   analogWriteFrequency(FAN_PWM_FREQUENTIE);
   stelFanSnelheid(0);  // bepaalAansturing()/pasAansturingToe() nemen het vanaf hier over

@@ -7,3 +7,4 @@ tools/.venv/
 logs/
 claude_resume
 tools/out*
+__pycache__/

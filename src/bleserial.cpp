@@ -19,7 +19,15 @@ public:
     void onDisconnect(NimBLEServer *server, NimBLEConnInfo &connInfo, int reason) override {
         _eigenaar->_setVerbonden(false);
         _eigenaar->_setGeabonneerd(false);  // volgende client moet opnieuw abonneren
-        server->getAdvertising()->start();  // weer adverteren voor een volgende verbinding
+        // Bekende race op deze stack: de controller is soms nog niet klaar
+        // met het verwerken van de disconnect als de host hier alweer
+        // opnieuw wil adverteren, waardoor start() false teruggeeft en er
+        // stilletjes niet meer geadverteerd wordt — geen volgende verbinding
+        // meer mogelijk totdat het board herstart. Geen console-logging
+        // (niet uit te lezen in het veld); main.cpp zet dit om in een korte
+        // rode-LED-knipper via heradverterenMislukt().
+        if (!server->getAdvertising()->start())
+            _eigenaar->_setHeradverterenMislukt();
     }
 
 private:
@@ -149,6 +157,19 @@ void BleSerial::_setVerbonden(bool verbonden)
 void BleSerial::_setGeabonneerd(bool geabonneerd)
 {
     _geabonneerd = geabonneerd;
+}
+
+void BleSerial::_setHeradverterenMislukt()
+{
+    _heradverterenMislukt = true;
+}
+
+bool BleSerial::heradverterenMislukt()
+{
+    if (!_heradverterenMislukt)
+        return false;
+    _heradverterenMislukt = false;
+    return true;
 }
 
 void BleSerial::_ontvangData(const uint8_t *data, size_t len)
