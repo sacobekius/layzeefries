@@ -1,18 +1,6 @@
 #include <arduino.h>
 #include <regusbcpow.h>
 #include "console.h"
-// Voor gpio_intr_disable()/gpio_intr_enable() — zie handleInterrupt(): de
-// gewone attachInterrupt()/detachInterrupt() delegeren naar
-// gpio_isr_handler_add()/remove(), die intern een gewone (niet ISR-veilige)
-// mutex gebruiken over de gedeelde ISR-handler-tabel. Die vanuit een ISR
-// aanroepen — wat detachInterrupt() in de ISR zelf tot nu toe deed — kan bij
-// contentie (de hoofdlus roept toevallig gelijktijdig attachInterrupt() aan)
-// tot een ISR leiden die nooit terugkeert, wat die kern permanent in
-// interrupt-context houdt: geen scheduler-tick, geen enkele andere
-// interrupt meer, en dus ook geen werkende task-watchdog meer om het op te
-// vangen. gpio_intr_disable()/enable() raken alleen het enable-bit van deze
-// ene GPIO aan (geen gedeelde tabel, geen mutex) en zijn wel ISR-veilig.
-#include <driver/gpio.h>
 
 // AP33772S_ADDRESS/INA238_ADDRESS staan als static constexpr in de klasse
 // zelf (regusbcpow.h) — uint8_t i.p.v. #define, dus een int-literal, want op
@@ -75,19 +63,13 @@ volatile bool interruptFired = false;
 
 static void handleInterrupt()
 {
-    // Uitzetten meteen: de AP33772S-INT-pin is level-triggered (blijft HIGH
-    // tot STATUS is uitgelezen), dus zonder dit zou een level-trigger
+    // Detach meteen: de AP33772S-INT-pin is level-triggered (blijft HIGH
+    // tot STATUS is uitgelezen), dus zonder detach zou een level-trigger
     // non-stop opnieuw afgaan totdat handleWork() aan de STATUS-read
     // toekomt (I2C is niet ISR-safe, kan dus niet hier) — precies de
     // interrupt-storm die eerder al een keer het board onbereikbaar maakte.
-    // gpio_intr_disable() i.p.v. detachInterrupt(): die laatste delegeert
-    // naar gpio_isr_handler_remove(), dat een gewone (niet ISR-veilige)
-    // mutex gebruikt — vanuit deze ISR aangeroepen kan dat, bij contentie
-    // met een gelijktijdige attachInterrupt()/gpio_intr_enable() vanuit de
-    // hoofdlus, een ISR opleveren die nooit terugkeert (zie de toelichting
-    // bovenaan dit bestand). handleWork() zet 'm met gpio_intr_enable()
-    // weer aan nadat de poll is afgehandeld.
-    gpio_intr_disable((gpio_num_t) interruptPin);
+    // handleWork() doet weer attach() nadat de poll is afgehandeld.
+    detachInterrupt(interruptPin);
     interruptFired = true;
 }
 
@@ -526,16 +508,14 @@ RotoPdStatus regUSBCPow::handleWork()
             // zonder op een verse READY te wachten voor dat tweede
             // commando — precies het patroon dat we nu juist vermijden.
         }
-        // Weer aanzetten — ongeacht of de poll hierboven via de 1s-klok dan
+        // Weer attach() — ongeacht of de poll hierboven via de 1s-klok dan
         // wel de interrupt kwam, en ongeacht of de STATUS-read slaagde: bij
         // een falende read willen we ook niet doof blijven voor de
         // volgende interrupt (de 1s-poll ving dat sowieso al op, maar dan
         // zonder de snelheidsbonus). Staat de pin nu nog HIGH (event nog
-        // niet echt gecleard), dan vuurt de ISR gewoon meteen opnieuw — geen
-        // storm, want handleInterrupt() zet 'm zelf meteen weer uit.
-        // gpio_intr_enable() i.p.v. attachInterrupt(): zie de toelichting
-        // bovenaan dit bestand en bij handleInterrupt().
-        gpio_intr_enable((gpio_num_t) interruptPin);
+        // niet echt gecleard), dan vuurt de ISR gewoon meteen opnieuw —
+        // geen storm, want handleInterrupt() zelf detacht meteen weer.
+        attachInterrupt(interruptPin, handleInterrupt, ONHIGH);
     }
     // Een vers NEWPDO-signaal betekent altijd: PDO-lijst opnieuw inlezen —
     // ongeacht wat _status daarvoor toevallig was. Niet vastklinken aan
