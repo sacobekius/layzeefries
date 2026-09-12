@@ -58,18 +58,23 @@ TwoWire *i2cPort{};
 // tot een volle seconde te wachten; blijft-ie een keer uit (zoals eerder
 // gebeurde), dan pakt de gewone 1s-poll het gewoon weer op — geen enkel
 // pad hangt hier nog van af.
+//
+// RISING (flank) i.p.v. ONHIGH (status): de INT-pin is weliswaar
+// level-triggered (blijft HIGH tot STATUS is uitgelezen), maar juist dat
+// read-to-clear-gedrag levert bij elk nieuw event vanzelf een schone,
+// op zichzelf staande flank op — laag (na de vorige geslaagde clear) ->
+// hoog (nieuw event) -> laag (wij lezen 'm uit) -> hoog (volgend event).
+// Een edge-trigger heeft dus geen detach/attach-cyclus nodig om een storm
+// te voorkomen: hij vuurt sowieso maar één keer per overgang, ongeacht hoe
+// lang de hoofdlus erover doet om te reageren. Het enige zwakke punt van
+// pure edge-detectie — een mislukte clear (I2C-fout) laat de lijn hangen
+// op HIGH, waarna er nooit meer een nieuwe flank komt — vangt de 1s-poll
+// hierboven al op, dus dat hoeft de interrupt zelf niet meer te dragen.
 static int interruptPin = -1;
 volatile bool interruptFired = false;
 
 static void handleInterrupt()
 {
-    // Detach meteen: de AP33772S-INT-pin is level-triggered (blijft HIGH
-    // tot STATUS is uitgelezen), dus zonder detach zou een level-trigger
-    // non-stop opnieuw afgaan totdat handleWork() aan de STATUS-read
-    // toekomt (I2C is niet ISR-safe, kan dus niet hier) — precies de
-    // interrupt-storm die eerder al een keer het board onbereikbaar maakte.
-    // handleWork() doet weer attach() nadat de poll is afgehandeld.
-    detachInterrupt(interruptPin);
     interruptFired = true;
 }
 
@@ -93,12 +98,8 @@ void regUSBCPow::begin(int i)
     // richting LOW te zakken.
     pinMode(i, INPUT_PULLDOWN);
     interruptPin = digitalPinToInterrupt(i);
-    // ONHIGH: echte level-trigger, matcht de datasheet ("Interrupt Signal").
-    // De detach/attach-cyclus (zie handleInterrupt()/handleWork()) voorkomt
-    // de storm die een kale ONHIGH eerder gaf. Maar zelfs met die cyclus is
-    // dit alleen nog een snelheidsbonus bovenop de 1s-poll — zie de
-    // toelichting hierboven bij interruptFired.
-    attachInterrupt(interruptPin, handleInterrupt, ONHIGH);
+    // RISING (flank) — zie de toelichting bij interruptFired hierboven.
+    attachInterrupt(interruptPin, handleInterrupt, RISING);
 
     reset();  // schone herstart van de PD-onderhandeling bij elke boot
 
@@ -508,14 +509,6 @@ RotoPdStatus regUSBCPow::handleWork()
             // zonder op een verse READY te wachten voor dat tweede
             // commando — precies het patroon dat we nu juist vermijden.
         }
-        // Weer attach() — ongeacht of de poll hierboven via de 1s-klok dan
-        // wel de interrupt kwam, en ongeacht of de STATUS-read slaagde: bij
-        // een falende read willen we ook niet doof blijven voor de
-        // volgende interrupt (de 1s-poll ving dat sowieso al op, maar dan
-        // zonder de snelheidsbonus). Staat de pin nu nog HIGH (event nog
-        // niet echt gecleard), dan vuurt de ISR gewoon meteen opnieuw —
-        // geen storm, want handleInterrupt() zelf detacht meteen weer.
-        attachInterrupt(interruptPin, handleInterrupt, ONHIGH);
     }
     // Een vers NEWPDO-signaal betekent altijd: PDO-lijst opnieuw inlezen —
     // ongeacht wat _status daarvoor toevallig was. Niet vastklinken aan
