@@ -341,17 +341,6 @@ Aansturing bepaalAansturing()
     int richting = koude_stand ? MODE_KOELEN
                   : warmte_stand ? MODE_VERWARMEN
                   : (fout > 0 ? MODE_KOELEN : MODE_VERWARMEN);
-    unsigned long now = millis();
-    if (now > next_log_tick) {
-      next_log_tick = now + 5000;
-      console.print("[");
-      console.print(now);
-      console.print("] Aansturing: ");
-      console.print((koude_stand || warmte_stand) ? "actieve vraag" : "grote fout");
-      console.print(" -> ");
-      console.print(richting == MODE_KOELEN ? "KOELEN " : "VERWARMEN ");
-      console.println(voltageMax);
-    }
     return { richting, voltageMax, (unsigned int) PID_STROOM_MA, 100, 100 };
   }
 
@@ -433,24 +422,18 @@ void pasAansturingToe(Aansturing a)
         digitalWrite(RELAIS1, HIGH);
         digitalWrite(RELAIS2, HIGH);
         actieveLed = LEDBLAUW;
-        ledAan(LEDBLAUW);
-        ledUit(LEDGEEL);
         usbpd.outputAan();
         break;
       case MODE_VERWARMEN:
         digitalWrite(RELAIS1, LOW);
         digitalWrite(RELAIS2, LOW);
         actieveLed = LEDGEEL;
-        ledUit(LEDBLAUW);
-        ledAan(LEDGEEL);
         usbpd.outputAan();
         break;
       default:  // MODE_UIT
         digitalWrite(RELAIS1, HIGH);
         digitalWrite(RELAIS2, HIGH);
         actieveLed = -1;
-        ledUit(LEDBLAUW);
-        ledUit(LEDGEEL);
         stroomUit();
         stelFanSnelheid(0);
         break;
@@ -463,7 +446,7 @@ void pasAansturingToe(Aansturing a)
 
   usbpd.setVoltage(a.voltage_mV, a.current_mA);
   stelFanSnelheid(a.fan_percentage);
-  setLedPlan(actieveLed, round(a.vermogen_percentage / 10.0)+0.1);
+  setLedPlan(actieveLed, round(a.vermogen_percentage / 10.0)+1);
 }
 
 // Leest de fysieke vriezerregelaar en reageert op een gewijzigde vraag.
@@ -484,7 +467,7 @@ void vraagTick()
     bool was_actief = vorige_koude_stand || vorige_warmte_stand;
     bool nu_actief = koude_stand || warmte_stand;
     if (was_actief && !nu_actief) {
-      doel_temperatuur = huidige_temperatuur - (vorige_koude_stand ? +1.0 : -1.0);
+      doel_temperatuur = huidige_temperatuur;
       // Startwaarde voor de integraal i.p.v. een reset naar 0 — zie
       // berekenAfschaalSeed(). Dooft niet uit, de normale I-opbouw stelt 'm
       // verder bij op de daadwerkelijke fout.
@@ -523,8 +506,8 @@ bool check_fout()
       setLedPlan(actieveLed, 0);
     actieveLed = -1;
     huidige_richting = -1;  // volgende pasAansturingToe() moet alles opnieuw zetten
-    ledUit(LEDBLAUW);
-    ledUit(LEDGEEL);
+    setLedPlan(LEDBLAUW, 0);
+    setLedPlan(LEDGEEL, 0);
     setLedPlan(LEDROOD, 10);  // steady aan; overheerst een eventueel lopende BLE-knipper (zie ledTick())
     roodKnipperActief = false;
   } else if (!rotopd_fout && in_fout) {
