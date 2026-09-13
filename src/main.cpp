@@ -49,19 +49,26 @@
 // iets anders komt — en de regelwet compenseert die schatting direct.
 // Eerste-orde model: dT/dt = -adrc_b0*correctie + verstoring(t). adrc_b0 is
 // GEEN vaste constante meer maar een lopend-gemiddelde schatting (zie
-// globals hieronder + seedObserver()): elke vol-vermogen-episode van
-// voldoende duur (ADRC_B0_KALIBRATIE_MIN_MS) geeft een verse, directe
-// (correctie, afkoelsnelheid)-meting — geen enkele veiligheidsrisico's
+// globals hieronder + kalibreerB0()/seedObserver()): elke vol-vermogen-
+// episode van voldoende duur (ADRC_B0_KALIBRATIE_MIN_MS) geeft een verse,
+// directe (correctie, afkoelsnelheid)-meting — geen enkele veiligheidsrisico's
 // zoals bij een drone-parameter, dus niets op tegen "gewoon even vol gas
 // proberen en meten" i.p.v. voorzichtig alleen uit oude logs schatten.
+// Apart bijgehouden voor koelen en verwarmen (adrc_b0_koelen/
+// adrc_b0_verwarmen): een Peltier is niet symmetrisch — de resistieve
+// (I²R) verliezen komen altijd op de warme kant terecht, wat verwarmen
+// helpt maar koelen tegenwerkt, dus verwarmen is doorgaans effectiever per
+// mV. Eén gedeelde b0 (in de praktijk vrijwel uitsluitend uit koelen-
+// episodes gekalibreerd, want die komen veel vaker voor) gaf stelselmatig
+// te grote verwarmen-correcties.
 // Fallback/startwaarde (voor de allereerste boot, of zolang NVS nog niets
-// geleerd heeft) uit tools/out1 (een meerdere uren durende bang-bang-
-// koelperiode op vol vermogen, gevraagd=28000mV dus correctie=grens=
-// 18000mV constant): t=665624ms T=4.31C -> t=27606072ms T=-2.75C, dus
-// ~-2.62e-4 C/s bij 18000mV -> ~1.46e-8 C/s per mV. Dat verwaarloost de
-// warmtelek (verstoring warmt juist op, camoufleert een deel van het
-// koeleffect), dus de werkelijke waarde ligt vermoedelijk iets hoger —
-// vandaar naar boven afgerond.
+// geleerd heeft, voor beide richtingen gelijk) uit tools/out1 (een
+// meerdere uren durende bang-bang-koelperiode op vol vermogen,
+// gevraagd=28000mV dus correctie=grens=18000mV constant): t=665624ms
+// T=4.31C -> t=27606072ms T=-2.75C, dus ~-2.62e-4 C/s bij 18000mV ->
+// ~1.46e-8 C/s per mV. Dat verwaarloost de warmtelek (verstoring warmt
+// juist op, camoufleert een deel van het koeleffect), dus de werkelijke
+// waarde ligt vermoedelijk iets hoger — vandaar naar boven afgerond.
 #define ADRC_B0_FALLBACK 0.00000002f   // 2e-8 C/s per mV
 // Alleen een episode van minstens deze duur vertrouwen om adrc_b0 bij te
 // stellen — korter is te ruisgevoelig (sensor-resolutie 0.0625C/tick).
@@ -98,6 +105,14 @@
 #define ADRC_Z2_SEED_MAX_FRACTIE 0.5f
 #define TREND_VENSTER 10
 #define VOLTAGE_MIN_MV 10000  // vloer voor de regeling — zie toelichting bij bepaalAansturing()
+// NB: outputUit() (zie stroomUit()) zet alleen VOUTCTL uit (het lokale pad
+// naar onze uitgang) en laat het lopende PD-contract (VREQ/IREQ) bewust
+// ongemoeid — een eerdere poging om dat via setVoltage() ook terug te
+// parkeren dwong een AVS->PPS-profielwissel af die op echte hardware
+// herhaalde OCP-fouten triggerde (de bron trok daarna zijn AVS/28000mV-
+// aanbod zelfs blijvend in). De "gevraagd"-regel in de log kan daardoor
+// tijdens stroomUit() nog het oude, niet meer actieve verzoek tonen — dat
+// is cosmetisch, en weegt niet op tegen dat risico.
 // Ventilator tijdens vasthouden: comfortband i.p.v. eerste hendel vóór de
 // spanning. Nooit onder de vloer (geen meerwaarde), comfortabel tot
 // FAN_COMFORT bij de eerste FAN_COMFORT_GRENS_PCT% van het vermogensbereik;
@@ -176,17 +191,30 @@ int huidige_richting = -1;
 float adrc_z1 = 0;
 float adrc_z2 = 0;
 // Lopend-gemiddelde schatting van de controle-effectiviteit (C/s per mV) —
-// zie ADRC_B0_FALLBACK/ADRC_B0_KALIBRATIE_MIN_MS/ADRC_B0_LEERSNELHEID
-// hierboven en seedObserver() verderop. In setup() overschreven door de
-// NVS-waarde indien een eerdere sessie al iets geleerd heeft.
-float adrc_b0 = ADRC_B0_FALLBACK;
+// apart voor koelen en verwarmen, want een Peltier is niet symmetrisch: de
+// resistieve (I²R) verliezen in het element komen altijd op de warme kant
+// terecht — dat helpt verwarmen (gratis extra warmte) maar werkt koelen
+// tegen (parasitaire warmte die de gepompte koeling deels tenietdoet).
+// Verwarmen is dus doorgaans effectiever per mV dan koelen; één gedeelde b0
+// (gekalibreerd op vrijwel uitsluitend koelen-episodes, in de praktijk) gaf
+// stelselmatig te grote verwarmen-correcties. Zie
+// ADRC_B0_FALLBACK/ADRC_B0_KALIBRATIE_MIN_MS/ADRC_B0_LEERSNELHEID hierboven
+// en kalibreerB0()/seedObserver() verderop. In setup() overschreven door de
+// NVS-waarden indien een eerdere sessie al iets geleerd heeft.
+float adrc_b0_koelen = ADRC_B0_FALLBACK;
+float adrc_b0_verwarmen = ADRC_B0_FALLBACK;
 // Nulmeting van de lopende vol-vermogen-episode (zie bepaalAansturing()'s
-// bang-bang-tak) — puur voor de adrc_b0-kalibratie in seedObserver(), los
+// bang-bang-tak) — puur voor de adrc_b0-kalibratie in kalibreerB0(), los
 // van de temp_geschiedenis-ringbuffer (die anders bij een korte episode
 // vervuild zou zijn met metingen van vóór de episode).
 bool was_in_bangbang = false;
 unsigned long bangbang_episode_start_tijd = 0;
 float bangbang_episode_start_temp = 0;
+// Richting die gold toen de lopende episode begon — een richtingwissel
+// (koelen<->verwarmen) binnen een aaneengesloten bang-bang-periode moet de
+// nulmeting óók resetten, anders vermengt seedObserver() twee episodes met
+// tegengestelde u_vol_vermogen tot een onzinnige b0-meting.
+int bangbang_episode_richting = -1;
 // Laatste 'correctie' (mV, signed, positief=koelen) die daadwerkelijk is
 // toegepast sinds de vorige ESO-update — nodig omdat die update het
 // b0*u-model van die periode moet aftrekken van de waargenomen verandering.
@@ -200,6 +228,15 @@ float laatst_toegepaste_correctie_mV = 0;
 // temperatuurmeting (temperatuurTick(), ~60s); zonder deze eigen klok zou
 // de waarnemer 60x te snel "updaten" op een meting die niet ververst is.
 unsigned long next_eso_tick = 0;
+// Wachten-op-kentering: na het loslaten van koude_vraag/warmte_vraag (zie
+// vraagTick()) staat alles uit (stroomUit()) en wordt er niet aangestuurd
+// tot de meting daadwerkelijk van richting wisselt — pas dan is de
+// thermische naijl (momentum van het net gestopte vol vermogen) voorbij en
+// heeft de fijnregeling weer zinnige informatie. kentering_richting is de
+// richting van de zojuist afgelopen episode (de kant waarin we nog naijl
+// verwachten); huidige_richting zelf is dan al -1 (door stroomUit()).
+bool wacht_op_kentering = false;
+int kentering_richting = -1;
 // Eigen, tragere klok specifiek voor de "Aansturing: ..."-logregel in
 // bepaalAansturing(). Sinds vraagTick() elke ~1s toepast (zie hierboven)
 // zou dit anders elke seconde opnieuw printen — bij een aanhoudende grote
@@ -326,6 +363,56 @@ struct Aansturing {
   unsigned int vermogen_percentage;  // ingezet vermogen t.o.v. maximaal (0-100), voor de richting-LED
 };
 
+// b0-kalibratie op de zojuist afgelopen vol-vermogen-episode (bangbang_
+// episode_start_tijd/_temp, zie bepaalAansturing()'s bang-bang-tak) — geen
+// vaste constante meer, maar een lopend gemiddelde dat elke voldoende lange
+// episode bijstelt. Alleen vertrouwen als de episode minstens
+// ADRC_B0_KALIBRATIE_MIN_MS duurde (korter is te ruisgevoelig, sensor-
+// resolutie 0.0625C/tick) en er daadwerkelijk een bekende richting is
+// toegepast (huidige_richting, niet vlak na boot). Dit is een koelkast, geen
+// drone die bij een verkeerde parameter uit de lucht valt — een paar minuten
+// "gewoon vol gas proberen en meten" geeft een prima directe indicatie,
+// veiliger dan blind op oude logs vertrouwen.
+//
+// Los van de ESO-seed (seedObserver() hieronder) omdat de twee niet meer
+// altijd op hetzelfde moment gebeuren: bij het loslaten van een externe
+// vraag (vraagTick()) is deze kalibratie nog geldig (de episode is echt
+// gebeurd), maar de ESO-seed wacht tot de kentering (zie wacht_op_kentering)
+// — vandaar dat dit vóór stroomUit() moet, die huidige_richting op -1 zet.
+void kalibreerB0(unsigned int voltageMax)
+{
+  float grens = (float) (voltageMax - VOLTAGE_MIN_MV);
+  float u_vol_vermogen = 0;
+  if (huidige_richting == MODE_KOELEN) u_vol_vermogen = grens;
+  else if (huidige_richting == MODE_VERWARMEN) u_vol_vermogen = -grens;
+  // anders (MODE_UIT/nog nooit toegepast): laat op 0 — kan alleen vlak na
+  // boot optreden, vóór ooit een geldige Aansturing is toegepast.
+  if (u_vol_vermogen == 0) return;
+
+  unsigned long episode_duur_ms = millis() - bangbang_episode_start_tijd;
+  if (episode_duur_ms < ADRC_B0_KALIBRATIE_MIN_MS) return;
+
+  float episode_trend_C_per_s =
+      (huidige_temperatuur - bangbang_episode_start_temp) / (episode_duur_ms / 1000.0f);
+  // b0 = -trend/u: bij koelen is u>0 en trend (normaal) <0, bij verwarmen
+  // andersom — deze formule geeft in beide gevallen een positieve b0.
+  float b0_gemeten = -episode_trend_C_per_s / u_vol_vermogen;
+  if (b0_gemeten <= 0) return;
+  // Negatief zou fysisch onzinnig zijn (een verstoring die vol vermogen
+  // volledig overheerst) — dan liever de oude waarde behouden dan 'm laten
+  // omslaan naar iets onbruikbaars.
+
+  bool was_koelen = huidige_richting == MODE_KOELEN;
+  float &adrc_b0 = was_koelen ? adrc_b0_koelen : adrc_b0_verwarmen;
+  adrc_b0 = (1.0f - ADRC_B0_LEERSNELHEID) * adrc_b0 + ADRC_B0_LEERSNELHEID * b0_gemeten;
+  prefs.putFloat(was_koelen ? "adrcB0Koel" : "adrcB0Warm", adrc_b0);
+  console.print(was_koelen ? "adrc_b0_koelen bijgesteld naar " : "adrc_b0_verwarmen bijgesteld naar ");
+  console.print(adrc_b0, 10);
+  console.print(" (meting: ");
+  console.print(b0_gemeten, 10);
+  console.println(")");
+}
+
 // Seedt de ESO (adrc_z1/adrc_z2) bij het verlaten van vol vermogen (naar
 // vasthouden) — analoog aan de oude berekenAfschaalSeed(), zelfde
 // TREND_VENSTER-ringbuffer, maar nu voor twee toestanden i.p.v. één
@@ -340,8 +427,13 @@ struct Aansturing {
 //    niet bijgewerkt): z2 = trend_C_per_s + adrc_b0 * u_vol_vermogen
 //    (u_vol_vermogen signed: +grens tijdens koelen, -grens tijdens
 //    verwarmen — zelfde tekenconventie als 'correctie' hieronder).
-// Gebruikt door zowel het loslaten van een externe vraag (vraagTick()) als
-// een eigen grote-fout-episode (bepaalAansturing()).
+// Gebruikt door het verlaten van een eigen grote-fout-episode
+// (bepaalAansturing()) — daar blijft doel_temperatuur ongewijzigd, dus de
+// trend tijdens de episode is nog steeds relatief aan hetzelfde doel en dus
+// bruikbaar. Bij vraagTick()'s externe-vraag-loslaat-pad wordt doel_
+// temperatuur WEL verzet (naar de huidige meting) en is deze trend niet meer
+// bruikbaar — dat pad wacht in plaats daarvan op een kentering (zie
+// wacht_op_kentering) en seedt dan direct met z2=0, zonder deze functie.
 //
 // Open tuningvraag: TREND_VENSTER (10 metingen = 10 minuten) was getuned
 // voor de oude AFSCHAAL_KD-seed, niet specifiek voor deze z2-afleiding —
@@ -357,37 +449,7 @@ void seedObserver(unsigned int voltageMax)
   float u_vol_vermogen = 0;
   if (huidige_richting == MODE_KOELEN) u_vol_vermogen = grens;
   else if (huidige_richting == MODE_VERWARMEN) u_vol_vermogen = -grens;
-  // anders (MODE_UIT/nog nooit toegepast): laat op 0 — kan alleen vlak na
-  // boot optreden, vóór ooit een geldige Aansturing is toegepast.
-
-  // adrc_b0-kalibratie: geen vaste constante meer, maar een lopend
-  // gemiddelde dat elke voldoende lange vol-vermogen-episode bijstelt.
-  // Alleen vertrouwen als de episode minstens ADRC_B0_KALIBRATIE_MIN_MS
-  // duurde (korter is te ruisgevoelig, sensor-resolutie 0.0625C/tick) en
-  // er daadwerkelijk een bekende richting is toegepast (niet vlak na boot).
-  // Dit is een koelkast, geen drone die bij een verkeerde parameter uit de
-  // lucht valt — een paar minuten "gewoon vol gas proberen en meten" geeft
-  // een prima directe indicatie, veiliger dan blind op oude logs vertrouwen.
-  unsigned long episode_duur_ms = millis() - bangbang_episode_start_tijd;
-  if (u_vol_vermogen != 0 && episode_duur_ms >= ADRC_B0_KALIBRATIE_MIN_MS) {
-    float episode_trend_C_per_s =
-        (huidige_temperatuur - bangbang_episode_start_temp) / (episode_duur_ms / 1000.0f);
-    // b0 = -trend/u: bij koelen is u>0 en trend (normaal) <0, bij verwarmen
-    // andersom — deze formule geeft in beide gevallen een positieve b0.
-    float b0_gemeten = -episode_trend_C_per_s / u_vol_vermogen;
-    if (b0_gemeten > 0) {
-      // Negatief zou fysisch onzinnig zijn (een verstoring die vol vermogen
-      // volledig overheerst) — dan liever de oude waarde behouden dan 'm
-      // laten omslaan naar iets onbruikbaars.
-      adrc_b0 = (1.0f - ADRC_B0_LEERSNELHEID) * adrc_b0 + ADRC_B0_LEERSNELHEID * b0_gemeten;
-      prefs.putFloat("adrcB0", adrc_b0);
-      console.print("adrc_b0 bijgesteld naar ");
-      console.print(adrc_b0, 10);
-      console.print(" (meting: ");
-      console.print(b0_gemeten, 10);
-      console.println(")");
-    }
-  }
+  float adrc_b0 = huidige_richting == MODE_KOELEN ? adrc_b0_koelen : adrc_b0_verwarmen;
 
   float z2_seed = trend_C_per_s + adrc_b0 * u_vol_vermogen;
   float z2_seed_grens = grens * adrc_b0 * ADRC_Z2_SEED_MAX_FRACTIE;
@@ -398,6 +460,19 @@ void seedObserver(unsigned int voltageMax)
   adrc_z2 = z2_seed;
   laatst_toegepaste_correctie_mV = u_vol_vermogen;
   next_eso_tick = millis() + ADRC_ESO_TICK_MS;  // niet meteen weer updaten met deze verse seed
+}
+
+// Neutrale ESO-seed na een kentering (zie wacht_op_kentering): geen trend-
+// gok meer nodig — de kentering zelf is het bewijs dat de naijl van de
+// afgelopen episode voorbij is, dus start gewoon schoon op de verse meting
+// en laat de normale ESO-opbouw (beta1/beta2 op echte residuen) z2 vanaf
+// hier leren.
+void seedEsoNeutraal()
+{
+  adrc_z1 = huidige_temperatuur;
+  adrc_z2 = 0;
+  laatst_toegepaste_correctie_mV = 0;
+  next_eso_tick = millis() + ADRC_ESO_TICK_MS;
 }
 
 // PI-regeling op de laatst gemeten temperatuur, bepaalt zowel richting als
@@ -443,8 +518,10 @@ Aansturing bepaalAansturing()
   if (was_grote_fout && !eigen_grote_fout) {
     // Terugkeer binnen de tolerantie ná een eigen grote-fout-episode (dus
     // niet via koude_vraag/warmte_vraag losgelaten — dat wordt al apart
-    // afgehandeld in vraagTick()). Zelfde ESO-seed, maar geen
-    // doel_temperatuur-wijziging: dat blijft ons eigen, al bestaande ijkpunt.
+    // afgehandeld in vraagTick()). doel_temperatuur wijzigt hier niet: dat
+    // blijft ons eigen, al bestaande ijkpunt, dus de trend tijdens de
+    // episode is nog steeds relatief aan hetzelfde doel en bruikbaar.
+    kalibreerB0(voltageMax);
     seedObserver(voltageMax);
   }
   was_grote_fout = eigen_grote_fout;
@@ -458,19 +535,21 @@ Aansturing bepaalAansturing()
   // afhandelen gaf te veel overshoot-risico — vandaar deze eigen drempel,
   // zodat dat ook geldt zonder aangesloten vriezerregelaar.
   bool in_bangbang_nu = koude_stand || warmte_stand || grote_fout;
-  if (in_bangbang_nu && !was_in_bangbang) {
-    // Nulmeting bij het INGAAN van een vol-vermogen-episode — puur voor de
+  int bangbang_richting = koude_stand ? MODE_KOELEN
+                : warmte_stand ? MODE_VERWARMEN
+                : (fout > 0 ? MODE_KOELEN : MODE_VERWARMEN);
+  if (in_bangbang_nu && (!was_in_bangbang || bangbang_richting != bangbang_episode_richting)) {
+    // Nulmeting bij het INGAAN van een vol-vermogen-episode, of bij een
+    // richtingwissel binnen een doorlopende episode — puur voor de
     // adrc_b0-kalibratie in seedObserver(), zie de globals hierboven.
     bangbang_episode_start_tijd = millis();
     bangbang_episode_start_temp = huidige_temperatuur;
+    bangbang_episode_richting = bangbang_richting;
   }
   was_in_bangbang = in_bangbang_nu;
   unsigned long now = millis();
   if (in_bangbang_nu) {
-    int richting = koude_stand ? MODE_KOELEN
-                  : warmte_stand ? MODE_VERWARMEN
-                  : (fout > 0 ? MODE_KOELEN : MODE_VERWARMEN);
-    const char* richting_txt = richting == MODE_KOELEN ? "koelen" : "verwarmen";
+    const char* richting_txt = bangbang_richting == MODE_KOELEN ? "koelen" : "verwarmen";
     if (now > next_log_tick)
     {
       next_log_tick = now + 5000;
@@ -481,7 +560,7 @@ Aansturing bepaalAansturing()
       console.print(", voltageMax: ");
       console.println(voltageMax);
     }
-    return { richting, voltageMax, (unsigned int) PID_STROOM_MA, 100, 100 };
+    return { bangbang_richting, voltageMax, (unsigned int) PID_STROOM_MA, 100, 100 };
   }
 
   // Spanning schaalt over het hele bereik (floor..max); de ventilator is
@@ -508,9 +587,12 @@ Aansturing bepaalAansturing()
     float beta2 = ADRC_OMEGA_O * ADRC_OMEGA_O;
 
     // Discrete Euler-stap op dT/dt = -adrc_b0*u + z2, met u = de correctie
-    // die sinds de vorige ESO-update daadwerkelijk toegepast werd.
+    // die sinds de vorige ESO-update daadwerkelijk toegepast werd — het
+    // TEKEN van die u bepaalt welke van de twee (koelen/verwarmen) b0's hier
+    // van toepassing was.
     float residu = huidige_temperatuur - adrc_z1;  // meting minus voorspelling
-    adrc_z1 += T_s * (adrc_z2 - adrc_b0 * laatst_toegepaste_correctie_mV + beta1 * residu);
+    float b0_toegepast = laatst_toegepaste_correctie_mV >= 0 ? adrc_b0_koelen : adrc_b0_verwarmen;
+    adrc_z1 += T_s * (adrc_z2 - b0_toegepast * laatst_toegepaste_correctie_mV + beta1 * residu);
     adrc_z2 += T_s * beta2 * residu;
   }
 
@@ -518,9 +600,15 @@ Aansturing bepaalAansturing()
   // schatting z1 (niet de rauwe meting — dat is precies het punt van de
   // ESO), plus rechtstreekse compensatie van de geschatte verstoring z2.
   // ADRC_OMEGA_C bepaalt hoe snel de fout mag wegregelen; adrc_b0 zet de
-  // gewenste C/s-correctie om in mV.
+  // gewenste C/s-correctie om in mV. Welke van de twee b0's van toepassing
+  // is hangt af van de richting van de correctie zelf — maar b0 is altijd
+  // positief, dus het TEKEN van de teller alleen bepaalt de richting; delen
+  // door de bijbehorende b0 verandert dat teken niet. Geen kip-en-ei-
+  // probleem dus.
   float fout_op_z1 = adrc_z1 - doel_temperatuur;
-  float correctie = (ADRC_OMEGA_C * fout_op_z1 + adrc_z2) / adrc_b0;  // signed
+  float teller = ADRC_OMEGA_C * fout_op_z1 + adrc_z2;
+  float adrc_b0 = teller >= 0 ? adrc_b0_koelen : adrc_b0_verwarmen;
+  float correctie = teller / adrc_b0;  // signed
   if (correctie < -grens) correctie = -grens;
   if (correctie > grens) correctie = grens;
   laatst_toegepaste_correctie_mV = correctie;  // input voor de VOLGENDE ESO-update
@@ -626,15 +714,24 @@ void vraagTick()
     bool was_actief = vorige_koude_stand || vorige_warmte_stand;
     bool nu_actief = koude_stand || warmte_stand;
     if (was_actief && !nu_actief) {
+      // b0-kalibratie op de zojuist afgelopen episode is nog geldig (die
+      // episode is echt gebeurd) — moet vóór stroomUit(), die huidige_
+      // richting op -1 zet.
+      kalibreerB0(usbpd.leesMaxVoltage());
+      // De episode liep net op vol vermogen; door thermische traagheid
+      // loopt de meting na het uitzetten nog even door in dezelfde richting
+      // (naijl/momentum) voordat 'm daadwerkelijk kantelt. Tot die kentering
+      // is elke trend-schatting nog steeds die naijl, niet de verstoring die
+      // geldt bij vasthouden op het nieuwe doel — dus nu niets aansturen,
+      // alleen het doel vastleggen en afwachten (zie temperatuurTick()).
+      kentering_richting = huidige_richting;
+      wacht_op_kentering = true;
       doel_temperatuur = huidige_temperatuur;
-      // Startwaarde voor de ESO i.p.v. een reset naar 0 — zie
-      // seedObserver(). Dooft niet uit, de normale ESO-opbouw stelt 'm
-      // verder bij op het daadwerkelijke verloop.
-      seedObserver(usbpd.leesMaxVoltage());
       prefs.putFloat("doelC", doel_temperatuur);
       console.print("Doeltemperatuur bijgewerkt: ");
       console.print(doel_temperatuur);
-      console.println("C");
+      console.println("C, wacht op kentering");
+      stroomUit();
     }
   }
 
@@ -647,8 +744,9 @@ void vraagTick()
   // check_fout() net expliciet uitzette een fractie later weer aanzetten
   // (bepaalAansturing() ziet de fout soms een tikje later dan check_fout(),
   // en pasAansturingToe() interpreteert huidige_richting==-1 dan als een
-  // "nieuwe" richting om toe te passen).
-  if (!in_fout)
+  // "nieuwe" richting om toe te passen). Niet tijdens wacht_op_kentering:
+  // zie de toelichting bij het zetten van die vlag hierboven.
+  if (!in_fout && !wacht_op_kentering)
     pasAansturingToe(bepaalAansturing());
 }
 
@@ -664,6 +762,7 @@ bool check_fout()
 
   if (rotopd_fout && !in_fout) {
     in_fout = true;
+    wacht_op_kentering = false;  // een echte fout maakt een lopende kentering-wacht irrelevant
     stroomUit();  // regelt zelf relais/fan/LED's, zie de toelichting daar
   } else if (!rotopd_fout && in_fout) {
     in_fout = false;
@@ -739,11 +838,13 @@ void setup() {
 
   prefs.begin("layzee", false);
   doel_temperatuur = prefs.getFloat("doelC", DOEL_TEMPERATUUR_FALLBACK_C);
-  // adrc_b0 is een lopend-gemiddelde schatting die elke vol-vermogen-
-  // episode bijstelt (zie seedObserver()) — persistent zodat een herstart
-  // niet terugvalt op de startschatting maar doorbouwt op wat eerdere
-  // sessies al geleerd hebben.
-  adrc_b0 = prefs.getFloat("adrcB0", ADRC_B0_FALLBACK);
+  // adrc_b0_koelen/adrc_b0_verwarmen zijn lopend-gemiddelde schattingen die
+  // elke vol-vermogen-episode bijstelt (zie kalibreerB0()) — apart per
+  // richting (een Peltier is niet symmetrisch, zie de toelichting bij de
+  // globals), en persistent zodat een herstart niet terugvalt op de
+  // startschatting maar doorbouwt op wat eerdere sessies al geleerd hebben.
+  adrc_b0_koelen = prefs.getFloat("adrcB0Koel", ADRC_B0_FALLBACK);
+  adrc_b0_verwarmen = prefs.getFloat("adrcB0Warm", ADRC_B0_FALLBACK);
 
   Serial.begin(9600);
   delay(1000); //Ensure everything got enough time to bootup
@@ -802,6 +903,16 @@ void setup() {
     console.println(numberOfSensors);
     console.println("Geen of te veel temperatuurmeters\n");
   }
+
+  // adrc_z1/adrc_z2 seeden met de echte meting i.p.v. hun compile-time 0 —
+  // anders moet de ESO na elke herstart eerst door een valse-opwarm-transient
+  // heen lopen (grote residu vanaf z1=0 laadt z2 op met een schijn-trend die
+  // de regelwet lang op verzadigd vol vermogen houdt, ook als de echte
+  // meting al bij het doel in de buurt is/verder daalt).
+  temperatuurTick();
+  adrc_z1 = huidige_temperatuur;
+  adrc_z2 = 0;
+
   digitalWrite(RELAIS1, HIGH);
   digitalWrite(RELAIS2, HIGH);
 
@@ -842,7 +953,26 @@ void loop() {
     if (now > next_temperatuurTick) {
       next_temperatuurTick = now + 60000;
       temperatuurTick();
-      if (!in_fout)
+      if (wacht_op_kentering) {
+        // Kentering: de verse meting beweegt niet meer in de richting van de
+        // afgelopen episode (naijl voorbij) — of vangnet: de afwijking t.o.v.
+        // doel_temperatuur is intussen zo groot geworden dat er iets anders
+        // aan de hand is dan uitdovend momentum (bv. deur open); dan niet
+        // langer wachten, de normale aansturing pakt via zijn eigen
+        // grote-fout-tak vanzelf weer op.
+        float delta = huidige_temperatuur - vorige_temperatuur;
+        bool nog_aan_het_naijlen =
+            (kentering_richting == MODE_KOELEN && delta <= 0) ||
+            (kentering_richting == MODE_VERWARMEN && delta >= 0);
+        bool te_grote_afwijking =
+            fabs(huidige_temperatuur - doel_temperatuur) > GROTE_FOUT_DREMPEL_C;
+        if (!nog_aan_het_naijlen || te_grote_afwijking) {
+          wacht_op_kentering = false;
+          seedEsoNeutraal();
+          console.println(te_grote_afwijking ? "Wachten op kentering afgebroken (te grote afwijking)" : "Kentering gedetecteerd, fijnregeling hervat");
+        }
+      }
+      if (!in_fout && !wacht_op_kentering)
         pasAansturingToe(bepaalAansturing());
     }
     if (now > next_status_tick) {

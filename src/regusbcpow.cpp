@@ -438,6 +438,7 @@ RotoPdStatus regUSBCPow::handleWork()
 
     if (now > _next_statusPoll || interruptFired)
     {
+        if (interruptFired) console.print(':');
         interruptFired = false;
         // De 1s-cadans is de garantie (zie het commentaar bij
         // interruptFired hierboven); een binnengekomen interrupt mag deze
