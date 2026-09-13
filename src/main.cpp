@@ -154,6 +154,11 @@ int demp_stand_dender = 0;
 RotoPdStatus huidige_pdo_status = RotoPdStatus::GEEN_PDO;
 // RotoPD-communicatie onbetrouwbaar (GEEN_PDO/PDO_OVERFLOW) — zie check_fout().
 bool in_fout = false;
+// BLE-advertentie kon na een disconnect niet opnieuw starten (zie
+// bleSerial.h) — blijft staan totdat er weer daadwerkelijk een client
+// verbindt (isVerbonden()), niet zomaar na één ledTick-cyclus: zie
+// werkRoodLedBij().
+bool ble_fout = false;
 // Was de fout t.o.v. doel_temperatuur de vorige keer groter dan
 // GROTE_FOUT_DREMPEL_C? Voor het detecteren van het loslaten van een eigen
 // (niet door koude_vraag/warmte_vraag getriggerde) grote-fout-episode, zie
@@ -219,28 +224,8 @@ int ledMoment = 0;
 
 void setLedPlan(int led, int deel);  // forward-declaratie: ledTick() hieronder gebruikt 'm al, definitie staat verderop
 
-bool roodKnipperActief = false;
-
 void ledTick()
 {
-  // Kort rood knipperen (via hetzelfde setLedPlan()/deel-mechanisme als
-  // blauw/geel) als de BLE-advertentie na een disconnect niet opnieuw kon
-  // starten (zie bleSerial.h) — geen console-logging mogelijk op dit board,
-  // dus dit is de enige melding. BLE-storing en RotoPD-storing zijn
-  // wezenlijk verschillend — de RotoPD-kant (steady aan, zie check_fout())
-  // overheerst altijd: hier dus alleen iets doen zolang er geen actieve
-  // in_fout is, en check_fout() zet roodKnipperActief zelf terug op false
-  // zodra een RotoPD-fout toeslaat.
-  if (!in_fout) {
-    if (roodKnipperActief) {
-      setLedPlan(LEDROOD, 0);
-      roodKnipperActief = false;
-    } else if (bleSerial.heradverterenMislukt()) {
-      setLedPlan(LEDROOD, 1);
-      roodKnipperActief = true;
-    }
-  }
-
   for (int ledPlanI = 0; ledPlanI < aantalLedPlannen; ledPlanI++) {
     if (ledMoment > ledPlannen[ledPlanI].deel && ledPlannen[ledPlanI].aan) {
       ledUit(ledPlannen[ledPlanI].led);
@@ -279,10 +264,28 @@ void initLedPlannen()
   }
 }
 
+void stelFanSnelheid(int percentage);  // forward-declaratie: stroomUit() hieronder gebruikt 'm al, definitie staat verderop
+
+// Eén centrale, zelfstandige "alles uit"-actie: relais naar de veilige
+// stand, PD-uitgang uit, ventilator uit, richting-LED's uit, en de
+// boekhouding (actieveLed/huidige_richting) zo teruggezet dat de
+// eerstvolgende pasAansturingToe() alles weer van scratch opbouwt. Eerder
+// stond dit verspreid over check_fout() en pasAansturingToe()'s MODE_UIT-
+// tak, allebei met hun eigen (net iets andere) subset — nu volstaat overal
+// gewoon één aanroep van stroomUit() zelf.
 void stroomUit()
 {
   console.println("stroomUit");
   usbpd.outputUit();
+  stelFanSnelheid(0);
+  digitalWrite(RELAIS1, HIGH);
+  digitalWrite(RELAIS2, HIGH);
+  if (actieveLed >= 0)
+    setLedPlan(actieveLed, 0);
+  actieveLed = -1;
+  huidige_richting = -1;
+  setLedPlan(LEDBLAUW, 0);
+  setLedPlan(LEDGEEL, 0);
 }
 
 void testLed(int led)
@@ -462,10 +465,22 @@ Aansturing bepaalAansturing()
     bangbang_episode_start_temp = huidige_temperatuur;
   }
   was_in_bangbang = in_bangbang_nu;
+  unsigned long now = millis();
   if (in_bangbang_nu) {
     int richting = koude_stand ? MODE_KOELEN
                   : warmte_stand ? MODE_VERWARMEN
                   : (fout > 0 ? MODE_KOELEN : MODE_VERWARMEN);
+    const char* richting_txt = richting == MODE_KOELEN ? "koelen" : "verwarmen";
+    if (now > next_log_tick)
+    {
+      next_log_tick = now + 5000;
+      console.print("[");
+      console.print(now);
+      console.print("] Aansturing: ");
+      console.print(richting_txt);
+      console.print(", voltageMax: ");
+      console.println(voltageMax);
+    }
     return { richting, voltageMax, (unsigned int) PID_STROOM_MA, 100, 100 };
   }
 
@@ -485,7 +500,6 @@ Aansturing bepaalAansturing()
   // net beëindigde grote-fout-episode te reageren — die snelheid raakt
   // alleen de TOEPASSING van de laatst geschatte z1/z2, niet de schatting
   // zelf.
-  unsigned long now = millis();
   if (now > next_eso_tick) {
     next_eso_tick = now + ADRC_ESO_TICK_MS;
 
@@ -580,11 +594,7 @@ void pasAansturingToe(Aansturing a)
         usbpd.outputAan();
         break;
       default:  // MODE_UIT
-        digitalWrite(RELAIS1, HIGH);
-        digitalWrite(RELAIS2, HIGH);
-        actieveLed = -1;
-        stroomUit();
-        stelFanSnelheid(0);
+        stroomUit();  // regelt zelf relais/fan/LED's, zie de toelichting daar
         break;
     }
     huidige_richting = a.richting;
@@ -633,7 +643,13 @@ void vraagTick()
   // die de ESO niet aanraakt (zie next_eso_tick daar) — vaker aanroepen
   // dan de trage 60s-cadans is dus veilig, en voorkomt dat de
   // eerste/eerstvolgende sturing tot een volle minuut op zich laat wachten.
-  pasAansturingToe(bepaalAansturing());
+  // Niet tijdens in_fout: anders kan deze aanroep de LED/richting die
+  // check_fout() net expliciet uitzette een fractie later weer aanzetten
+  // (bepaalAansturing() ziet de fout soms een tikje later dan check_fout(),
+  // en pasAansturingToe() interpreteert huidige_richting==-1 dan als een
+  // "nieuwe" richting om toe te passen).
+  if (!in_fout)
+    pasAansturingToe(bepaalAansturing());
 }
 
 // Bewaakt alleen nog de RotoPD-communicatie — geen modus-stack meer nodig:
@@ -648,23 +664,34 @@ bool check_fout()
 
   if (rotopd_fout && !in_fout) {
     in_fout = true;
-    stroomUit();
-    digitalWrite(RELAIS1, HIGH);
-    digitalWrite(RELAIS2, HIGH);
-    if (actieveLed >= 0)
-      setLedPlan(actieveLed, 0);
-    actieveLed = -1;
-    huidige_richting = -1;  // volgende pasAansturingToe() moet alles opnieuw zetten
-    setLedPlan(LEDBLAUW, 0);
-    setLedPlan(LEDGEEL, 0);
-    setLedPlan(LEDROOD, 10);  // steady aan; overheerst een eventueel lopende BLE-knipper (zie ledTick())
-    roodKnipperActief = false;
+    stroomUit();  // regelt zelf relais/fan/LED's, zie de toelichting daar
   } else if (!rotopd_fout && in_fout) {
     in_fout = false;
-    setLedPlan(LEDROOD, 0);
   }
+  // De rode LED zelf wordt niet hier gezet — zie werkRoodLedBij() in de
+  // hoofdlus, die in_fout en ble_fout samen tot één duty-cycle vertaalt.
 
   return in_fout;
+}
+
+// Rode-LED-protocol: BLE-fout op zichzelf 1/10 (kort knipperlicht),
+// RotoPD-fout op zichzelf 5/10 (half-om-half), beide tegelijk 9/10 (bijna
+// continu aan, kort knippertje) — drie visueel goed te onderscheiden
+// patronen. Het plan wordt hier, centraal in de hoofdlus, uit de twee
+// onafhankelijke foutstaten afgeleid — check_fout() en de BLE-callbacks
+// (zie bleserial.cpp) hebben zelf geen weet meer van setLedPlan()/LEDROOD.
+void werkRoodLedBij()
+{
+  if (bleSerial.heradverterenMislukt())
+    ble_fout = true;
+  if (bleSerial.isVerbonden())
+    ble_fout = false;  // een geslaagde (her)verbinding maakt de eerdere mislukking irrelevant
+
+  int deel = (in_fout && ble_fout) ? 9
+           : in_fout ? 5
+           : ble_fout ? 1
+           : 0;
+  setLedPlan(LEDROOD, deel);
 }
 
 void wifiOtaSetup()
@@ -815,7 +842,8 @@ void loop() {
     if (now > next_temperatuurTick) {
       next_temperatuurTick = now + 60000;
       temperatuurTick();
-      pasAansturingToe(bepaalAansturing());
+      if (!in_fout)
+        pasAansturingToe(bepaalAansturing());
     }
     if (now > next_status_tick) {
       next_status_tick = now + 60000;
@@ -823,6 +851,7 @@ void loop() {
     }
     if (now > next_ledTick) {
       next_ledTick = now + 200;
+      werkRoodLedBij();
       ledTick();
     }
   } else

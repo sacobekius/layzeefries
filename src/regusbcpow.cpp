@@ -438,13 +438,23 @@ RotoPdStatus regUSBCPow::handleWork()
 
     if (now > _next_statusPoll || interruptFired)
     {
-        _next_statusPoll = now + 1000;
         interruptFired = false;
         // De 1s-cadans is de garantie (zie het commentaar bij
         // interruptFired hierboven); een binnengekomen interrupt mag deze
         // read alleen vervroegen. Lezen reset het register (datasheet:
         // "Reset to 0 after every Read").
         i2c_read(CMD_STATUS, 1);
+        // Na een mislukte poll niet de volle 1s wachten op de volgende
+        // poging: dat vertraagt de bevestiging van 3 opeenvolgende
+        // mislukkingen (_i2cFoutTeller, verderop) onnodig — op echte
+        // hardware minstens ~3s vanaf het loskoppelen van de PD-bron
+        // voordat een fout ooit bevestigd kon worden, zichtbaar als een
+        // trage rode LED. Sneller opnieuw proberen bevestigt (of weerlegt)
+        // een vermoede fout veel eerder, zonder de drempel van 3 zelf te
+        // verlagen — dat blijft dus even goed bestand tegen een enkele
+        // transiënte NACK. Zodra een poll weer slaagt, terug naar de
+        // normale, rustige 1s-cadans.
+        _next_statusPoll = now + (_trans_stat == 0 ? 1000 : 250);
         // Bij falen niets te verwerken (geen geldige data) — de eventuele
         // degradatie naar GEEN_PDO gebeurt hierna centraal, pas na een paar
         // opeenvolgende mislukkingen (zie _i2cFoutTeller).
@@ -663,23 +673,22 @@ RotoPdStatus regUSBCPow::handleWork()
         }
     }
 
-    // Output aan/uit — TIJDELIJK UITGESCHAKELD voor de AVS-diagnose.
-    // outputAan()/outputUit() zetten nog wel _gewildOutputAan/
-    // _outputWijzigingGewenst (main.cpp's aanroepen hoeven niet te
-    // wijzigen), maar de daadwerkelijke VOUTCTL-write hieronder gebeurt nu
-    // niet meer: VOUTCTL blijft op zijn power-on-default staan (0x10, bits
-    // 1:0 = 00 = auto). Reden: de trace liet zien dat spanning/stroom
-    // elektrisch prima waren terwijl STATUS.UVP + de FAULT-LED toch bleven
-    // hangen — mogelijk omdat ons eigen forceren van VOUTCTL (aan/uit) de
-    // chip's eigen schakelaar-/foutherstellogica overrulet/maskeert, i.p.v.
-    // de chip zelf te laten herstellen via alleen een verse RDO (zoals de
-    // datasheet beschrijft: "load a new PD_REQMSG ... to resume").
-    // if (_i2cVeilig && _outputWijzigingGewenst)
-    // {
-    //     _writeBuf[0] = _gewildOutputAan ? 0b00010010 : 0b00010001;
-    //     i2c_write(CMD_SYSTEM, 1);
-    //     _outputWijzigingGewenst = false;
-    // }
+    // Output aan/uit — lange tijd uitgeschakeld geweest tijdens de
+    // AVS-diagnose: de trace liet toen zien dat spanning/stroom elektrisch
+    // prima waren terwijl STATUS.UVP + de FAULT-LED toch bleven hangen,
+    // met als vermoeden dat ons eigen forceren van VOUTCTL de chip's eigen
+    // foutherstellogica zou overrulen. Die aanname was achterhaald: de
+    // daadwerkelijke oorzaak van die UVP-FAULT was UVP_EN (zie begin()),
+    // niet dit VOUTCTL-forceren. Nu weer aan: zonder deze write doet
+    // outputUit() elektrisch niets (VOUTCTL blijft op power-on-default
+    // "auto" staan), dus stroomUit() in main.cpp zette dan wel relais/
+    // fan/LED's uit maar de PD-uitgang zelf bleef gewoon aan staan.
+    if (_i2cVeilig && _outputWijzigingGewenst)
+    {
+        _writeBuf[0] = _gewildOutputAan ? 0b00010010 : 0b00010001;
+        i2c_write(CMD_SYSTEM, 1);
+        _outputWijzigingGewenst = false;
+    }
 
     // Spanning/stroom — wens van setVoltage()/setStroom(), of de periodieke
     // AVS/PPS-herbevestiging (_stuurAan() beheert _next_avsTick zelf).
@@ -695,7 +704,23 @@ RotoPdStatus regUSBCPow::handleWork()
     // echte hardware niet dat de PDO ook echt weg was; de rest bleef gewoon
     // werken.
     if (_i2cFoutTeller >= 3)
+    {
         _status = RotoPdStatus::GEEN_PDO;
+        // Zonder dit blijven leesMinVoltage()/leesMaxVoltage() de OUDE,
+        // niet meer te vertrouwen PDO-lijst rapporteren totdat er ooit weer
+        // een verse srcpdo()-cyclus loopt — en die kan alleen starten via
+        // een NEWPDO-event, dus juist niet zolang de verbinding weg is. Op
+        // echte hardware gaf dat een niet-deterministisch lange periode
+        // (tot de kabel weer terug was) waarin bepaalAansturing() gewoon
+        // doorging met een spanning die allang niet meer klopte, i.p.v.
+        // meteen "PDO-bereik nog niet bekend, wacht" te zien. Nu wordt de
+        // PDO-lijst ONMIDDELLIJK ongeldig zodra we hier degraderen, precies
+        // gelijk aan de bestaande in_fout-drempel — geen apart, later
+        // moment meer waarop dit pas doorwerkt.
+        _avsPDOIndex = -1;
+        _ppsPDOIndex = -1;
+        _huidigPDOIndex = -1;
+    }
     return _status;
 }
 
